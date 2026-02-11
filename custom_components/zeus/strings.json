@@ -13,7 +13,7 @@
       },
       "tibber_auth": {
         "title": "Authenticate with Tibber",
-        "description": "Enter your Tibber personal access token. You can create one at [developer.tibber.com](https://developer.tibber.com/settings/access-token).",
+        "description": "Enter your Tibber personal access token. You can create one at {tibber_token_url}.",
         "data": {
           "access_token": "Access token"
         },

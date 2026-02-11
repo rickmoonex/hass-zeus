@@ -137,6 +137,9 @@ class ZeusConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="tibber_auth",
             data_schema=STEP_TIBBER_AUTH_SCHEMA,
             errors=errors,
+            description_placeholders={
+                "tibber_token_url": "https://developer.tibber.com/settings/access-token"
+            },
         )
 
     @classmethod
