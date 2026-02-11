@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from datetime import timedelta
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -11,18 +13,23 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_ENERGY_USAGE_ENTITY,
     CONF_FORECAST_ENTITY,
     CONF_MAX_POWER_OUTPUT,
     CONF_PRODUCTION_ENTITY,
+    CONF_SWITCH_ENTITY,
     DOMAIN,
     SUBENTRY_HOME_MONITOR,
     SUBENTRY_SOLAR_INVERTER,
+    SUBENTRY_SWITCH_DEVICE,
 )
 from .coordinator import PriceCoordinator
 
@@ -39,6 +46,17 @@ def _device_info(entry: ConfigEntry) -> DeviceInfo:
     )
 
 
+def _read_entity_float(hass: HomeAssistant, entity_id: str | None) -> float | None:
+    """Read a numeric value from an entity state, returning None on failure."""
+    if not entity_id or hass is None:
+        return None
+    state = hass.states.get(entity_id)
+    if state and state.state not in ("unknown", "unavailable"):
+        with contextlib.suppress(ValueError, TypeError):
+            return float(state.state)
+    return None
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -47,12 +65,19 @@ async def async_setup_entry(
     """Set up Zeus sensor entities."""
     coordinator: PriceCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    # All entities share a single device. Don't pass config_subentry_id
-    # so the device isn't incorrectly linked to a specific subentry.
-    # Cleanup on subentry removal is handled by the update listener reload.
+    # Global sensors (shared Zeus Energy Manager device)
     entities: list[SensorEntity] = [
         ZeusCurrentPriceSensor(coordinator, entry),
         ZeusNextSlotPriceSensor(coordinator, entry),
+        ZeusSolarSurplusSensor(coordinator, entry),
+        ZeusSolarSelfConsumptionRatioSensor(coordinator, entry),
+        ZeusHomeConsumptionSensor(coordinator, entry),
+        ZeusGridImportSensor(coordinator, entry),
+        ZeusSolarFractionSensor(coordinator, entry),
+        ZeusTodayAveragePriceSensor(coordinator, entry),
+        ZeusTodayMinPriceSensor(coordinator, entry),
+        ZeusTodayMaxPriceSensor(coordinator, entry),
+        ZeusCheapestUpcomingPriceSensor(coordinator, entry),
     ]
 
     entities.extend(
@@ -62,6 +87,18 @@ async def async_setup_entry(
     )
 
     async_add_entities(entities)
+
+    # Per-switch-device sensors (linked to their subentry)
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type == SUBENTRY_SWITCH_DEVICE:
+            async_add_entities(
+                [
+                    ZeusDeviceRuntimeTodaySensor(
+                        coordinator, entry, subentry.subentry_id, hass
+                    ),
+                ],
+                config_subentry_id=subentry.subentry_id,
+            )
 
 
 class ZeusCurrentPriceSensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
@@ -182,8 +219,8 @@ class ZeusRecommendedOutputSensor(CoordinatorEntity[PriceCoordinator], SensorEnt
     @callback
     def _update_recommended_output(self) -> None:
         """Calculate the recommended inverter output percentage."""
-        # If price is not negative, produce at full capacity
-        if not self.coordinator.is_price_negative():
+        # If Zeus is disabled or price is not negative, produce at full capacity
+        if not self.coordinator.enabled or not self.coordinator.is_price_negative():
             self._attr_native_value = 100.0
             self._update_extra_attributes()
             return
@@ -337,3 +374,447 @@ class ZeusRecommendedOutputSensor(CoordinatorEntity[PriceCoordinator], SensorEnt
                 )
 
         return attrs
+
+
+# ---------------------------------------------------------------------------
+# Helper: read solar production and home consumption from subentries
+# ---------------------------------------------------------------------------
+
+
+def _get_solar_production(hass: HomeAssistant, entry: ConfigEntry) -> float | None:
+    """Read current solar production in watts from inverter subentry."""
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type == SUBENTRY_SOLAR_INVERTER:
+            return _read_entity_float(hass, subentry.data.get(CONF_PRODUCTION_ENTITY))
+    return None
+
+
+def _get_home_consumption(hass: HomeAssistant, entry: ConfigEntry) -> float | None:
+    """Read current home consumption in watts from home monitor subentry."""
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type == SUBENTRY_HOME_MONITOR:
+            return _read_entity_float(hass, subentry.data.get(CONF_ENERGY_USAGE_ENTITY))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Global sensors: Solar & energy
+# ---------------------------------------------------------------------------
+
+
+class ZeusSolarSurplusSensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
+    """Real-time solar surplus in watts (production - consumption)."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "solar_surplus"
+    _attr_native_unit_of_measurement = "W"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the solar surplus sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_solar_surplus"
+        self._attr_device_info = _device_info(entry)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        production = _get_solar_production(self.hass, self._entry)
+        consumption = _get_home_consumption(self.hass, self._entry)
+        if production is not None and consumption is not None:
+            self._attr_native_value = round(max(0.0, production - consumption), 1)
+        else:
+            self._attr_native_value = None
+
+
+class ZeusSolarSelfConsumptionRatioSensor(
+    CoordinatorEntity[PriceCoordinator], SensorEntity
+):
+    """Percentage of solar production consumed by the home (not exported)."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "solar_self_consumption_ratio"
+    _attr_native_unit_of_measurement = "%"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the solar self-consumption ratio sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_solar_self_consumption_ratio"
+        self._attr_device_info = _device_info(entry)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        production = _get_solar_production(self.hass, self._entry)
+        consumption = _get_home_consumption(self.hass, self._entry)
+        if production is not None and production > 0 and consumption is not None:
+            # Self-consumption = min(consumption, production) / production
+            self_consumed = min(consumption, production)
+            self._attr_native_value = round((self_consumed / production) * 100.0, 1)
+        else:
+            self._attr_native_value = None
+
+
+class ZeusHomeConsumptionSensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
+    """Home power consumption in watts."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "home_consumption"
+    _attr_native_unit_of_measurement = "W"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the home consumption sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_home_consumption"
+        self._attr_device_info = _device_info(entry)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        consumption = _get_home_consumption(self.hass, self._entry)
+        self._attr_native_value = (
+            round(consumption, 1) if consumption is not None else None
+        )
+
+
+class ZeusGridImportSensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
+    """Grid import in watts (consumption minus production, 0 if producing surplus)."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "grid_import"
+    _attr_native_unit_of_measurement = "W"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the grid import sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_grid_import"
+        self._attr_device_info = _device_info(entry)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        production = _get_solar_production(self.hass, self._entry)
+        consumption = _get_home_consumption(self.hass, self._entry)
+        if consumption is not None:
+            prod = production if production is not None else 0.0
+            self._attr_native_value = round(max(0.0, consumption - prod), 1)
+        else:
+            self._attr_native_value = None
+
+
+class ZeusSolarFractionSensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
+    """Percentage of home consumption covered by solar production."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "solar_fraction"
+    _attr_native_unit_of_measurement = "%"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the solar fraction sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_solar_fraction"
+        self._attr_device_info = _device_info(entry)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        production = _get_solar_production(self.hass, self._entry)
+        consumption = _get_home_consumption(self.hass, self._entry)
+        if production is not None and consumption is not None and consumption > 0:
+            fraction = min(100.0, (production / consumption) * 100.0)
+            self._attr_native_value = round(fraction, 1)
+        elif consumption is not None and consumption == 0:
+            # No consumption — solar covers 100% (trivially)
+            self._attr_native_value = 100.0 if production and production > 0 else 0.0
+        else:
+            self._attr_native_value = None
+
+
+# ---------------------------------------------------------------------------
+# Global sensors: Price analytics
+# ---------------------------------------------------------------------------
+
+
+class _ZeusPriceSensorBase(CoordinatorEntity[PriceCoordinator], SensorEntity):
+    """Base class for price-derived sensors."""
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = "EUR/kWh"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 4
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the price sensor base."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_device_info = _device_info(entry)
+
+    def _get_today_slots(self) -> list[Any]:
+        """Return all price slots for today."""
+        if not self.coordinator.data:
+            return []
+        home = self.coordinator.get_first_home_name()
+        if not home:
+            return []
+        now = dt_util.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        return [
+            s
+            for s in self.coordinator.data.get(home, [])
+            if today_start <= s.start_time < tomorrow_start
+        ]
+
+    def _get_future_slots(self) -> list[Any]:
+        """Return all price slots from now onwards."""
+        if not self.coordinator.data:
+            return []
+        home = self.coordinator.get_first_home_name()
+        if not home:
+            return []
+        now = dt_util.now()
+        return [
+            s
+            for s in self.coordinator.data.get(home, [])
+            if s.start_time + timedelta(minutes=15) > now
+        ]
+
+
+class ZeusTodayAveragePriceSensor(_ZeusPriceSensorBase):
+    """Average energy price across all of today's slots."""
+
+    _attr_translation_key = "today_average_price"
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the today average price sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_today_average_price"
+        self._update_state()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        slots = self._get_today_slots()
+        if slots:
+            self._attr_native_value = sum(s.price for s in slots) / len(slots)
+            self._attr_extra_state_attributes = {"slot_count": len(slots)}
+        else:
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {}
+
+
+class ZeusTodayMinPriceSensor(_ZeusPriceSensorBase):
+    """Lowest energy price today (with time attribute)."""
+
+    _attr_translation_key = "today_min_price"
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the today min price sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_today_min_price"
+        self._update_state()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        slots = self._get_today_slots()
+        if slots:
+            cheapest = min(slots, key=lambda s: s.price)
+            self._attr_native_value = cheapest.price
+            self._attr_extra_state_attributes = {
+                "slot_start": cheapest.start_time.isoformat(),
+            }
+        else:
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {}
+
+
+class ZeusTodayMaxPriceSensor(_ZeusPriceSensorBase):
+    """Highest energy price today (with time attribute)."""
+
+    _attr_translation_key = "today_max_price"
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the today max price sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_today_max_price"
+        self._update_state()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        slots = self._get_today_slots()
+        if slots:
+            most_expensive = max(slots, key=lambda s: s.price)
+            self._attr_native_value = most_expensive.price
+            self._attr_extra_state_attributes = {
+                "slot_start": most_expensive.start_time.isoformat(),
+            }
+        else:
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {}
+
+
+class ZeusCheapestUpcomingPriceSensor(_ZeusPriceSensorBase):
+    """Cheapest upcoming slot price (with time attribute)."""
+
+    _attr_translation_key = "cheapest_upcoming_price"
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the cheapest upcoming price sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_cheapest_upcoming_price"
+        self._update_state()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        slots = self._get_future_slots()
+        if slots:
+            cheapest = min(slots, key=lambda s: s.price)
+            self._attr_native_value = cheapest.price
+            self._attr_extra_state_attributes = {
+                "slot_start": cheapest.start_time.isoformat(),
+            }
+        else:
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {}
+
+
+# ---------------------------------------------------------------------------
+# Per-device sensors
+# ---------------------------------------------------------------------------
+
+
+class ZeusDeviceRuntimeTodaySensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
+    """Minutes a managed device has run today (from scheduler results)."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "device_runtime_today"
+    _attr_native_unit_of_measurement = "min"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 1
+
+    def __init__(
+        self,
+        coordinator: PriceCoordinator,
+        entry: ConfigEntry,
+        subentry_id: str,
+        hass: HomeAssistant,
+    ) -> None:
+        """Initialize the device runtime today sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._subentry_id = subentry_id
+        self._attr_unique_id = f"{entry.entry_id}_{subentry_id}_runtime_today"
+
+        subentry = entry.subentries.get(subentry_id)
+        device_name = subentry.title if subentry else "Switch Device"
+        self._attr_translation_placeholders = {"device_name": device_name}
+
+        switch_entity = subentry.data[CONF_SWITCH_ENTITY] if subentry else ""
+        self._attr_device_info = _get_device_info_for_switch(
+            hass, switch_entity, entry, subentry_id, device_name
+        )
+
+        # Initial value from schedule results
+        result = coordinator.schedule_results.get(subentry_id)
+        if result:
+            daily = float(subentry.data.get("daily_runtime", 0) if subentry else 0)
+            self._attr_native_value = round(daily - result.remaining_runtime_min, 1)
+        else:
+            self._attr_native_value = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        result = self.coordinator.schedule_results.get(self._subentry_id)
+        if result:
+            subentry = self._entry.subentries.get(self._subentry_id)
+            daily = float(subentry.data.get("daily_runtime", 0) if subentry else 0)
+            self._attr_native_value = round(
+                max(0.0, daily - result.remaining_runtime_min), 1
+            )
+        else:
+            self._attr_native_value = None
+        self.async_write_ha_state()
+
+
+def _get_device_info_for_switch(
+    hass: HomeAssistant,
+    entity_id: str,
+    entry: ConfigEntry,
+    subentry_id: str,
+    device_name: str,
+) -> DeviceInfo:
+    """
+    Get device info for the target switch entity.
+
+    Mirrors the logic in binary_sensor.py — if the entity belongs to an
+    existing device, link to that device. Otherwise use a Zeus-managed device.
+    """
+    ent_reg = er.async_get(hass)
+
+    ent_entry = ent_reg.async_get(entity_id)
+    if ent_entry and ent_entry.device_id:
+        dev_reg = dr.async_get(hass)
+        device = dev_reg.async_get(ent_entry.device_id)
+        if device and device.identifiers:
+            return DeviceInfo(identifiers=device.identifiers)
+
+    # Fallback: Zeus-managed device
+    return DeviceInfo(
+        identifiers={(DOMAIN, f"{entry.entry_id}_{subentry_id}")},
+        name=device_name,
+        manufacturer="Zeus",
+        entry_type=DeviceEntryType.SERVICE,
+    )

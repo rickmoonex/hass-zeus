@@ -79,6 +79,8 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         self._solar_unsub: CALLBACK_TYPE | None = None
         self._price_override: float | None = None
         self.schedule_results: dict[str, ScheduleResult] = {}
+        self._scheduler_module: Any | None = None
+        self._enabled: bool = True
 
     @callback
     def _async_start_slot_timer(self) -> None:
@@ -246,6 +248,19 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         return price < 0
 
     @property
+    def enabled(self) -> bool:
+        """Return whether Zeus management is enabled."""
+        return self._enabled
+
+    @callback
+    def async_set_enabled(self, *, enabled: bool) -> None:
+        """Enable or disable Zeus management."""
+        self._enabled = enabled
+        _LOGGER.info("Zeus management %s", "enabled" if enabled else "disabled")
+        if self.data is not None:
+            self.async_set_updated_data(self.data)
+
+    @property
     def price_override(self) -> float | None:
         """Return the current price override, or None if not set."""
         return self._price_override
@@ -306,14 +321,23 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         Called automatically on each coordinator update and can also
         be triggered manually via the zeus.run_scheduler service.
         """
-        if not self._has_switch_devices() or self.config_entry is None:
+        if (
+            not self._enabled
+            or not self._has_switch_devices()
+            or self.config_entry is None
+        ):
             self.schedule_results = {}
             return
 
-        scheduler = importlib.import_module(".scheduler", __package__)
+        # Lazy-import the scheduler module to avoid circular imports.
+        # Cache it after the first load so importlib only runs once.
+        if self._scheduler_module is None:
+            self._scheduler_module = await self.hass.async_add_import_executor_job(
+                importlib.import_module, ".scheduler", __package__
+            )
 
         try:
-            self.schedule_results = await scheduler.async_run_scheduler(
+            self.schedule_results = await self._scheduler_module.async_run_scheduler(
                 self.hass, self.config_entry, self
             )
         except Exception:  # noqa: BLE001

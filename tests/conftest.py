@@ -31,6 +31,11 @@ def auto_enable_custom_integrations(hass: HomeAssistant) -> None:
     hass.data.pop(loader.DATA_CUSTOM_COMPONENTS)
 
 
+@pytest.fixture(autouse=True)
+def _auto_recorder(recorder_mock) -> None:
+    """Ensure recorder is available for all tests (required dependency)."""
+
+
 @pytest.fixture
 def mock_config_entry(hass: HomeAssistant) -> MockConfigEntry:
     """Create a mock config entry."""

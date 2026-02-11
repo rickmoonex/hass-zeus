@@ -185,8 +185,38 @@
       "recommended_inverter_output": {
         "name": "Recommended inverter output"
       },
+      "solar_surplus": {
+        "name": "Solar surplus"
+      },
+      "solar_self_consumption_ratio": {
+        "name": "Solar self-consumption ratio"
+      },
+      "home_consumption": {
+        "name": "Home consumption"
+      },
+      "grid_import": {
+        "name": "Grid import"
+      },
+      "solar_fraction": {
+        "name": "Solar fraction"
+      },
+      "today_average_price": {
+        "name": "Today average price"
+      },
+      "today_min_price": {
+        "name": "Today minimum price"
+      },
+      "today_max_price": {
+        "name": "Today maximum price"
+      },
+      "cheapest_upcoming_price": {
+        "name": "Cheapest upcoming price"
+      },
       "switch_device_remaining_runtime": {
         "name": "{device_name} remaining runtime"
+      },
+      "device_runtime_today": {
+        "name": "{device_name} runtime today"
       }
     },
     "binary_sensor": {
@@ -195,6 +225,11 @@
       },
       "device_schedule": {
         "name": "{device_name} schedule"
+      }
+    },
+    "switch": {
+      "master_switch": {
+        "name": "Master switch"
       }
     }
   }

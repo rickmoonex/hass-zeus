@@ -275,6 +275,18 @@ class ZeusDeviceScheduleSensor(CoordinatorEntity[PriceCoordinator], BinarySensor
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle coordinator update — apply schedule result and sync switch."""
+        # When Zeus is disabled, turn off all managed devices
+        if not self.coordinator.enabled:
+            if self._attr_is_on:
+                self._attr_is_on = False
+                switch_entity = self._subentry_data.get(CONF_SWITCH_ENTITY)
+                if switch_entity:
+                    self.hass.async_create_task(
+                        self._async_control_switch(switch_entity, turn_on=False)
+                    )
+            self.async_write_ha_state()
+            return
+
         result = self.coordinator.schedule_results.get(self._subentry_id)
         if result is None:
             return
