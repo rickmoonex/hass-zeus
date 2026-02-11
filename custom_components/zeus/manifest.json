@@ -9,6 +9,7 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/rickmoonex/zeus/issues",
   "requirements": [],
-  "dependencies": [],
+  "after_dependencies": ["forecast_solar"],
+  "dependencies": ["recorder"],
   "version": "0.1.0"
 }
