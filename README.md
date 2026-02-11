@@ -113,8 +113,8 @@ For each device, if the remaining runtime needed equals or exceeds the number of
 The scheduler iteratively picks the globally cheapest `(device, slot)` pair:
 
 1. For each slot, compute a cost score:
-   - **Full solar surplus** covers the device's peak usage: cost = **-feed_in_rate** (or -1.0 if no feed-in rate configured)
-   - **Partial solar surplus**: cost = price x (1 - solar_fraction) - feed_in_rate x solar_fraction
+   - **Full solar surplus** covers the device's peak usage: cost = **-energy_price** (the spot price you'd earn by exporting; -1.0 if spot price is zero or negative)
+   - **Partial solar surplus**: cost = price x (1 - solar_fraction) - energy_price x solar_fraction
    - **No solar**: cost = grid price
 2. Pick the cheapest combination across all devices
 3. Deduct the device's power draw from the slot's remaining solar surplus
@@ -147,17 +147,18 @@ When live solar surplus exceeds the forecast for the current slot, Zeus computes
 
 This only applies when live exceeds forecast (bias > 1.0). It never reduces future slot values.
 
-### Feed-in opportunity cost
+### Solar opportunity cost
 
-When a **feed-in rate** is configured on the solar inverter subentry, the scheduler accounts for the revenue you lose by using solar to power a device instead of exporting it to the grid.
+The scheduler automatically accounts for the revenue you lose by using solar to power a device instead of exporting it to the grid. Without Dutch salderingsregeling (net metering), feed-in compensation equals the **spot price** (energy-only price from Tibber) -- which Zeus already knows for every 15-minute slot.
 
-Without a feed-in rate, running a device on solar is considered free (cost = -1.0, always preferred). With a feed-in rate, using solar has an **opportunity cost** equal to the export revenue you forgo. This means:
+Each slot's spot price is used as the opportunity cost of consuming solar. This means:
 
-- If a future grid slot is cheaper than the feed-in rate, the scheduler may prefer to **export solar now** and **run the device on cheap grid later**
+- If a future grid slot is cheaper than the current spot price, the scheduler may prefer to **export solar now** and **run the device on cheap grid later**
 - If grid prices are high, it still prefers solar (using it avoids a high grid cost)
-- Without solar surplus in a slot, the feed-in rate has no effect -- the device simply pays the grid price
+- When the spot price is zero or negative, solar is always preferred (cost = -1.0)
+- Without solar surplus in a slot, the spot price has no effect -- the device simply pays the grid price
 
-This produces more economically optimal schedules for users with export tariffs.
+Because the spot price varies every 15 minutes, the opportunity cost is different for each slot -- producing more economically optimal schedules than a static feed-in rate.
 
 ### Actual device power usage
 

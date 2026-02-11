@@ -18,7 +18,6 @@ CONF_PRODUCTION_ENTITY = "production_entity"
 CONF_OUTPUT_CONTROL_ENTITY = "output_control_entity"
 CONF_MAX_POWER_OUTPUT = "max_power_output"
 CONF_FORECAST_ENTITY = "forecast_entity"
-CONF_FEED_IN_RATE = "feed_in_rate"
 
 # Home energy monitor subentry config keys
 CONF_ENERGY_USAGE_ENTITY = "energy_usage_entity"

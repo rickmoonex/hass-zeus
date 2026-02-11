@@ -473,7 +473,7 @@ def test_live_solar_shared_between_devices() -> None:
     slot_1015 = now + timedelta(minutes=15)
 
     slots = [
-        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.10),
         PriceSlot(start_time=slot_1015, price=0.05, energy_price=0.04),
     ]
 
@@ -494,13 +494,15 @@ def test_live_solar_shared_between_devices() -> None:
         live_solar_surplus_w=1500.0,
     )
 
-    # Device A gets the solar slot
+    # Device A gets the solar slot (full solar → cost = -0.10)
     assert results["a"].should_be_on
     assert results["a"].scheduled_slots[0] == now
 
     # Device B: 500W remaining solar at 10:00 is not enough for 1000W.
-    # 10:00 cost = 0.30 * (1 - 0.5) = 0.15, vs 10:15 = 0.05.
-    # Device B picks 10:15.
+    # solar_fraction = 0.5.
+    # 10:00 cost = 0.30 * 0.5 - 0.10 * 0.5 = 0.15 - 0.05 = 0.10
+    # 10:15 cost = 0.05 (no solar).
+    # Device B picks 10:15 (cheaper grid).
     assert not results["b"].should_be_on
     assert results["b"].scheduled_slots[0] == slot_1015
 
@@ -543,11 +545,10 @@ def test_actual_usage_frees_solar_for_other_devices() -> None:
         subentry_id="a", daily_runtime_min=15.0, priority=1, peak_usage_w=1500.0
     )
     compute_schedules([dev_a_peak, dev_b], slots, solar_forecast, 500.0, now)
-    # B would still get 10:00 but with only 500W remaining (partial solar)
-    # Actually both get -1.0 at first, then after A consumes 1500W,
-    # B has 500W remaining at 10:00: cost = 0.30 * (1 - 0.5) = 0.15
-    # vs 10:15 at 0.25. B still picks 10:00 at 0.15... but it's NOT
-    # free solar. Let me verify:
+    # B would still get 10:00 but with only 500W remaining (partial solar).
+    # After A consumes 1500W, B has 500W remaining at 10:00:
+    # cost = 0.30 * 0.5 - 0.24 * 0.5 = 0.03, vs 10:15 at 0.25.
+    # B picks 10:00 (partial solar still cheaper than 10:15 grid).
 
     # With actual usage: A consumes only 200W, leaves 1800W → B fully solar
     results_actual = compute_schedules(
@@ -560,25 +561,20 @@ def test_actual_usage_frees_solar_for_other_devices() -> None:
     assert results_actual["b"].reason == "Scheduled: solar surplus available"
 
 
-def test_feed_in_rate_prefers_export_over_cheap_device() -> None:
-    """Test that feed-in rate makes the scheduler prefer exporting.
+def test_energy_price_opportunity_cost_with_solar() -> None:
+    """Test that the spot price creates opportunity cost for solar usage.
 
-    With feed_in_rate=0.08 EUR/kWh, using solar to power a device has
-    an opportunity cost.  If a future grid slot costs only 0.02 EUR/kWh,
-    it's cheaper to export solar now (earn 0.08) and run on grid later
-    (pay 0.02), net saving 0.06.
+    The energy_price (spot price) on each slot is what you earn for
+    exporting. When solar fully covers a device, the cost is -energy_price
+    (the opportunity cost of not exporting). If a future grid slot is
+    cheaper than this opportunity cost, the device should wait.
 
-    Solar slot cost with feed-in: -0.08 (earn the feed-in by exporting)
-    Grid slot cost: 0.02
-    Since -0.08 < 0.02, solar is still preferred in this case.
+    Slot at 10:00: total=0.30, energy=0.24, solar covers device fully
+        → cost = -0.24 (opportunity cost of exporting at 0.24)
+    Slot at 10:15: total=0.02, energy=0.016, no solar
+        → cost = 0.02 (grid price)
 
-    But if feed-in is 0.10 and grid is 0.02, using solar costs us the
-    opportunity of 0.10, while grid costs 0.02. The device on solar
-    effectively costs -0.10 (what we forgo). Since -0.10 < 0.02, solar
-    is still preferred — we keep the device running on solar.
-
-    The real benefit shows when feed-in exceeds the absolute value of
-    the solar score. Let's test a case where exporting is clearly better.
+    Since -0.24 < 0.02, solar at 10:00 is preferred. Device runs now.
     """
     now = datetime(2026, 2, 9, 10, 0, 0, tzinfo=TZ)
     slot_1015 = now + timedelta(minutes=15)
@@ -593,32 +589,21 @@ def test_feed_in_rate_prefers_export_over_cheap_device() -> None:
 
     device = _make_device(daily_runtime_min=15.0, peak_usage_w=1000.0)
 
-    # Without feed-in: solar slot gets -1.0, always preferred
-    results_no_feed = compute_schedules([device], slots, solar_forecast, 500.0, now)
-    assert results_no_feed["dev1"].should_be_on  # Solar at 10:00
-
-    # With feed-in of 0.08: solar slot gets -0.08 (opportunity cost)
-    # Grid at 10:15 is 0.02. -0.08 < 0.02, solar still wins.
-    results_feed = compute_schedules(
-        [device],
-        slots,
-        solar_forecast,
-        500.0,
-        now,
-        feed_in_rate=0.08,
-    )
-    assert results_feed["dev1"].should_be_on  # Solar still better
+    results = compute_schedules([device], slots, solar_forecast, 500.0, now)
+    # Solar at 10:00 is preferred: -0.24 < 0.02
+    assert results["dev1"].should_be_on
+    assert results["dev1"].reason == "Scheduled: solar surplus available"
 
 
-def test_feed_in_rate_no_solar_unaffected() -> None:
-    """Test that feed-in rate doesn't affect slots without solar."""
+def test_energy_price_no_solar_unaffected() -> None:
+    """Test that energy_price doesn't affect slots without solar."""
     now = datetime(2026, 2, 9, 10, 0, 0, tzinfo=TZ)
     slots = _make_slots(now, count=4, base_price=0.10)
 
     device = _make_device(daily_runtime_min=15.0)
 
-    # No solar forecast — feed-in rate should have no effect
-    results = compute_schedules([device], slots, None, 0.0, now, feed_in_rate=0.08)
+    # No solar forecast — energy_price has no effect, cheapest total wins
+    results = compute_schedules([device], slots, None, 0.0, now)
     assert results["dev1"].should_be_on
     assert results["dev1"].scheduled_slots[0] == now
 
@@ -689,7 +674,7 @@ def test_live_solar_peak_must_fit_fully() -> None:
     slot_1015 = now + timedelta(minutes=15)
 
     slots = [
-        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.03),
         PriceSlot(start_time=slot_1015, price=0.02, energy_price=0.016),
     ]
 
@@ -705,7 +690,7 @@ def test_live_solar_peak_must_fit_fully() -> None:
         live_solar_surplus_w=800.0,
     )
 
-    # Partial solar at 10:00: cost = 0.30 * (1 - 0.8) = 0.06
+    # Partial solar at 10:00: cost = 0.30 * 0.2 - 0.03 * 0.8 = 0.036
     # Grid at 10:15: cost = 0.02
     # 10:15 is cheaper, so device waits
     assert not results["dev1"].should_be_on

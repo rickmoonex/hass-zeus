@@ -35,7 +35,6 @@ from .const import (
     CONF_DEADLINE,
     CONF_ENERGY_PROVIDER,
     CONF_ENERGY_USAGE_ENTITY,
-    CONF_FEED_IN_RATE,
     CONF_FORECAST_ENTITY,
     CONF_MAX_POWER_OUTPUT,
     CONF_MIN_CYCLE_TIME,
@@ -203,15 +202,6 @@ class SolarInverterSubentryFlow(ConfigSubentryFlow):
                             device_class="power",
                         )
                     ),
-                    vol.Optional(CONF_FEED_IN_RATE): NumberSelector(
-                        NumberSelectorConfig(
-                            min=0,
-                            max=1,
-                            step=0.001,
-                            unit_of_measurement="EUR/kWh",
-                            mode=NumberSelectorMode.BOX,
-                        )
-                    ),
                 }
             ),
         )
@@ -255,15 +245,6 @@ class SolarInverterSubentryFlow(ConfigSubentryFlow):
                             EntitySelectorConfig(
                                 domain="sensor",
                                 device_class="power",
-                            )
-                        ),
-                        vol.Optional(CONF_FEED_IN_RATE): NumberSelector(
-                            NumberSelectorConfig(
-                                min=0,
-                                max=1,
-                                step=0.001,
-                                unit_of_measurement="EUR/kWh",
-                                mode=NumberSelectorMode.BOX,
                             )
                         ),
                     }

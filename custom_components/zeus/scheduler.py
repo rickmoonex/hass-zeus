@@ -25,7 +25,6 @@ from .const import (
     CONF_DAILY_RUNTIME,
     CONF_DEADLINE,
     CONF_ENERGY_USAGE_ENTITY,
-    CONF_FEED_IN_RATE,
     CONF_MIN_CYCLE_TIME,
     CONF_PEAK_USAGE,
     CONF_POWER_SENSOR,
@@ -270,7 +269,8 @@ class _SlotInfo:
     """Pre-computed information for a single time slot."""
 
     start_time: datetime
-    price: float
+    price: float  # Total price (energy + tax) — consumption cost
+    energy_price: float  # Energy-only price — feed-in compensation / export value
     solar_production_w: float  # Raw forecast production for this hour
     solar_surplus_w: float  # Production minus home consumption (shared pool)
     remaining_solar_w: float  # Surplus still available after device assignments
@@ -321,6 +321,7 @@ def _build_slot_info(
             continue
 
         price = slot.price if slot.price is not None else 0.0
+        energy_price = slot.energy_price if slot.energy_price is not None else 0.0
 
         # Look up solar production for this slot's hour
         solar_production_w = 0.0
@@ -339,6 +340,7 @@ def _build_slot_info(
         info[slot.start_time] = _SlotInfo(
             start_time=slot.start_time,
             price=price,
+            energy_price=energy_price,
             solar_production_w=solar_production_w,
             solar_surplus_w=solar_surplus_w,
             remaining_solar_w=solar_surplus_w,
@@ -403,7 +405,6 @@ def _apply_live_solar_override(
 def _cost_for_device_in_slot(
     slot: _SlotInfo,
     device_peak_w: float,
-    feed_in_rate: float | None = None,
 ) -> float:
     """
     Compute the marginal cost of running a device in a slot.
@@ -412,31 +413,33 @@ def _cost_for_device_in_slot(
     consumed their share) so that concurrent devices correctly split the
     available surplus.
 
-    When ``feed_in_rate`` is provided, accounts for the opportunity cost of
-    using solar to power a device instead of exporting it.  If exporting
-    earns more than the grid price in a future slot, it may be cheaper to
-    export now and run the device later on cheap grid.
+    The slot's ``energy_price`` (spot price) is used as the opportunity cost
+    of consuming solar instead of exporting it: without saldering, feed-in
+    compensation equals the spot price.  If a future grid slot is cheaper
+    than the current spot price, the device should run later and export now.
 
     Returns:
         A cost score where lower is better.  Full solar coverage yields a
-        negative score (free solar minus feed-in opportunity cost), partial
-        solar yields a proportionally reduced price, and no solar yields the
-        raw grid price.
+        negative score (opportunity cost of the spot price), partial solar
+        yields a proportionally reduced price, and no solar yields the raw
+        grid price (total incl. tax).
 
     """
+    feed_in = slot.energy_price  # spot price = what you earn for export
+
     if slot.remaining_solar_w >= device_peak_w:
         # Solar fully covers this device.
         # Opportunity cost: we lose the feed-in revenue for this power.
-        if feed_in_rate is not None and feed_in_rate > 0:
-            return -feed_in_rate
+        if feed_in > 0:
+            return -feed_in
         return -1.0
 
     if slot.remaining_solar_w > 0:
         solar_fraction = slot.remaining_solar_w / device_peak_w
         grid_cost = slot.price * (1.0 - solar_fraction)
         # Subtract opportunity cost of the solar portion we consume
-        if feed_in_rate is not None and feed_in_rate > 0:
-            opportunity_cost = feed_in_rate * solar_fraction
+        if feed_in > 0:
+            opportunity_cost = feed_in * solar_fraction
             return grid_cost - opportunity_cost
         return grid_cost
 
@@ -523,7 +526,6 @@ def _find_cheapest_assignment(
     states: dict[str, _DeviceState],
     slot_info: dict[datetime, _SlotInfo],
     now: datetime,
-    feed_in_rate: float | None = None,
 ) -> tuple[DeviceScheduleRequest | None, datetime | None]:
     """Find the single globally cheapest (device, slot) pair to assign next."""
     best_cost = float("inf")
@@ -541,9 +543,7 @@ def _find_cheapest_assignment(
         for st in eligible:
             if st in already:
                 continue
-            cost = _cost_for_device_in_slot(
-                slot_info[st], device.peak_usage_w, feed_in_rate
-            )
+            cost = _cost_for_device_in_slot(slot_info[st], device.peak_usage_w)
 
             # Pick lowest cost; break ties by priority (lower = better)
             if cost < best_cost or (
@@ -558,18 +558,17 @@ def _find_cheapest_assignment(
     return best_device, best_slot_time
 
 
-def _apply_cost_optimal(  # noqa: PLR0913
+def _apply_cost_optimal(
     active_devices: list[DeviceScheduleRequest],
     states: dict[str, _DeviceState],
     slot_info: dict[datetime, _SlotInfo],
     now: datetime,
     current_slot_start: datetime,
-    feed_in_rate: float | None = None,
 ) -> None:
     """Phase 2: Iteratively assign the globally cheapest (device, slot) pair."""
     while True:
         best_device, best_slot_time = _find_cheapest_assignment(
-            active_devices, states, slot_info, now, feed_in_rate
+            active_devices, states, slot_info, now
         )
         if best_device is None or best_slot_time is None:
             break
@@ -629,7 +628,6 @@ def compute_schedules(  # noqa: PLR0913
     home_consumption_w: float,
     now: datetime,
     live_solar_surplus_w: float | None = None,
-    feed_in_rate: float | None = None,
 ) -> dict[str, ScheduleResult]:
     """
     Compute the globally optimal schedule for all devices.
@@ -646,10 +644,9 @@ def compute_schedules(  # noqa: PLR0913
     When ``live_solar_surplus_w`` is provided, the current slot's solar
     surplus is upgraded to the live value if it exceeds the forecast.
 
-    When ``feed_in_rate`` is provided (EUR/kWh earned for exporting),
-    the scheduler accounts for the opportunity cost of consuming solar
-    instead of exporting it.  If a future grid slot is cheaper than the
-    feed-in revenue, the device runs later on cheap grid and exports now.
+    Each slot's ``energy_price`` (the spot price without tax) is used as the
+    feed-in opportunity cost — what you'd earn by exporting solar instead of
+    consuming it.  If a future grid slot is cheaper, the device runs later.
 
     Devices that are currently ON report their ``actual_usage_w`` via
     the power sensor.  For the current slot, this actual draw is used
@@ -686,9 +683,7 @@ def compute_schedules(  # noqa: PLR0913
     active_devices.sort(key=lambda d: d.priority)
 
     _apply_deadline_forced(active_devices, states, slot_info, now, current_slot_start)
-    _apply_cost_optimal(
-        active_devices, states, slot_info, now, current_slot_start, feed_in_rate
-    )
+    _apply_cost_optimal(active_devices, states, slot_info, now, current_slot_start)
 
     for device in active_devices:
         results[device.subentry_id] = _build_result(
@@ -770,11 +765,6 @@ async def async_run_scheduler(
         f"{live_solar_surplus_w:.0f}" if live_solar_surplus_w is not None else "None",
     )
 
-    # Get feed-in rate from solar inverter config (if configured)
-    feed_in_rate = _get_feed_in_rate(entry)
-    if feed_in_rate is not None:
-        _LOGGER.debug("Scheduler: feed_in_rate=%.4f EUR/kWh", feed_in_rate)
-
     now = dt_util.now()
 
     return compute_schedules(
@@ -784,7 +774,6 @@ async def async_run_scheduler(
         home_consumption_w,
         now,
         live_solar_surplus_w=live_solar_surplus_w,
-        feed_in_rate=feed_in_rate,
     )
 
 
@@ -813,26 +802,6 @@ def _get_home_consumption(hass: HomeAssistant, entry: ConfigEntry) -> float:
                     except (ValueError, TypeError):
                         pass
     return 0.0
-
-
-def _get_feed_in_rate(entry: ConfigEntry) -> float | None:
-    """
-    Get the feed-in tariff rate from the solar inverter subentry.
-
-    Returns the rate in EUR/kWh, or None if not configured.
-    """
-    for subentry in entry.subentries.values():
-        if subentry.subentry_type != SUBENTRY_SOLAR_INVERTER:
-            continue
-        rate = subentry.data.get(CONF_FEED_IN_RATE)
-        if rate is not None:
-            try:
-                rate_f = float(rate)
-                if rate_f > 0:
-                    return rate_f
-            except (ValueError, TypeError):
-                pass
-    return None
 
 
 def _get_live_solar_surplus(

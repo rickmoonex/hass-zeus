@@ -47,15 +47,13 @@
             "production_entity": "Current production entity",
             "output_control_entity": "Output control entity",
             "max_power_output": "Maximum power output",
-            "forecast_entity": "Solar forecast entity",
-            "feed_in_rate": "Feed-in rate"
+            "forecast_entity": "Solar forecast entity"
           },
           "data_description": {
             "production_entity": "Sensor entity that reports the current solar production in watts.",
             "output_control_entity": "Number entity that controls the inverter output (0-100%).",
             "max_power_output": "The maximum power output of the inverter in watts.",
-            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes.",
-            "feed_in_rate": "How much you earn per kWh for exporting solar to the grid. Used to decide whether to power devices with solar or export it. Leave empty if you don't have a feed-in tariff."
+            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes."
           }
         },
         "reconfigure": {
@@ -66,15 +64,13 @@
             "production_entity": "Current production entity",
             "output_control_entity": "Output control entity",
             "max_power_output": "Maximum power output",
-            "forecast_entity": "Solar forecast entity",
-            "feed_in_rate": "Feed-in rate"
+            "forecast_entity": "Solar forecast entity"
           },
           "data_description": {
             "production_entity": "Sensor entity that reports the current solar production in watts.",
             "output_control_entity": "Number entity that controls the inverter output (0-100%).",
             "max_power_output": "The maximum power output of the inverter in watts.",
-            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes.",
-            "feed_in_rate": "How much you earn per kWh for exporting solar to the grid. Used to decide whether to power devices with solar or export it. Leave empty if you don't have a feed-in tariff."
+            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes."
           }
         }
       },
