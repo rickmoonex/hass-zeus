@@ -1,0 +1,17 @@
+# Home Assistant core (pin to your minimum supported version)
+homeassistant==2026.2.1
+
+# Testing
+pytest==9.0.0
+pytest-asyncio==1.3.0
+pytest-cov==7.0.0
+pytest-homeassistant-custom-component==0.13.314
+
+# Linting / formatting (also provided by nix, but useful for CI)
+ruff==0.9.6
+
+# Type checking
+mypy==1.14.1
+
+# Utilities
+colorlog==6.9.0

@@ -1,0 +1,201 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Zeus",
+        "description": "Configure Zeus to manage your dynamic energy bill.",
+        "data": {
+          "energy_provider": "Energy price provider"
+        },
+        "data_description": {
+          "energy_provider": "Select the integration to use for fetching energy prices."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the energy provider",
+      "provider_not_found": "The selected energy provider integration is not set up. Please set up {provider} first.",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Zeus is already configured"
+    }
+  },
+  "config_subentries": {
+    "solar_inverter": {
+      "entry_type": "Solar Inverter",
+      "initiate_flow": {
+        "user": "Add solar inverter",
+        "reconfigure": "Reconfigure solar inverter"
+      },
+      "step": {
+        "user": {
+          "title": "Add solar inverter",
+          "description": "Configure a solar inverter to manage its output based on energy prices.",
+          "data": {
+            "name": "Name",
+            "production_entity": "Current production entity",
+            "output_control_entity": "Output control entity",
+            "max_power_output": "Maximum power output",
+            "forecast_entity": "Solar forecast entity",
+            "feed_in_rate": "Feed-in rate"
+          },
+          "data_description": {
+            "production_entity": "Sensor entity that reports the current solar production in watts.",
+            "output_control_entity": "Number entity that controls the inverter output (0-100%).",
+            "max_power_output": "The maximum power output of the inverter in watts.",
+            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes.",
+            "feed_in_rate": "How much you earn per kWh for exporting solar to the grid. Used to decide whether to power devices with solar or export it. Leave empty if you don't have a feed-in tariff."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure solar inverter",
+          "description": "Update the solar inverter configuration.",
+          "data": {
+            "name": "Name",
+            "production_entity": "Current production entity",
+            "output_control_entity": "Output control entity",
+            "max_power_output": "Maximum power output",
+            "forecast_entity": "Solar forecast entity",
+            "feed_in_rate": "Feed-in rate"
+          },
+          "data_description": {
+            "production_entity": "Sensor entity that reports the current solar production in watts.",
+            "output_control_entity": "Number entity that controls the inverter output (0-100%).",
+            "max_power_output": "The maximum power output of the inverter in watts.",
+            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes.",
+            "feed_in_rate": "How much you earn per kWh for exporting solar to the grid. Used to decide whether to power devices with solar or export it. Leave empty if you don't have a feed-in tariff."
+          }
+        }
+      },
+      "abort": {
+        "already_configured": "A solar inverter is already configured",
+        "reconfigure_successful": "Inverter reconfigured successfully"
+      }
+    },
+    "home_monitor": {
+      "entry_type": "Home Energy Monitor",
+      "initiate_flow": {
+        "user": "Add home energy monitor",
+        "reconfigure": "Reconfigure home energy monitor"
+      },
+      "step": {
+        "user": {
+          "title": "Add home energy monitor",
+          "description": "Configure a home energy monitor to track your household consumption.",
+          "data": {
+            "name": "Name",
+            "energy_usage_entity": "Energy usage entity"
+          },
+          "data_description": {
+            "energy_usage_entity": "Sensor entity that reports the live home energy usage in watts. Positive values indicate consumption, negative values indicate production."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure home energy monitor",
+          "description": "Update the home energy monitor configuration.",
+          "data": {
+            "name": "Name",
+            "energy_usage_entity": "Energy usage entity"
+          },
+          "data_description": {
+            "energy_usage_entity": "Sensor entity that reports the live home energy usage in watts. Positive values indicate consumption, negative values indicate production."
+          }
+        }
+      },
+      "abort": {
+        "already_configured": "A home energy monitor is already configured",
+        "reconfigure_successful": "Monitor reconfigured successfully"
+      }
+    },
+    "switch_device": {
+      "entry_type": "Switch Device",
+      "initiate_flow": {
+        "user": "Add switch device",
+        "reconfigure": "Reconfigure switch device"
+      },
+      "step": {
+        "user": {
+          "title": "Add switch device",
+          "description": "Configure a device to be scheduled based on energy prices and solar forecast.",
+           "data": {
+            "name": "Name",
+            "switch_entity": "Switch entity",
+            "power_sensor": "Power sensor",
+            "peak_usage": "Peak power usage",
+            "daily_runtime": "Required daily runtime",
+            "deadline": "Deadline",
+            "priority": "Priority",
+            "min_cycle_time": "Minimum cycle time"
+          },
+          "data_description": {
+            "switch_entity": "Switch or input_boolean entity that controls the device.",
+            "power_sensor": "Sensor entity that reports the current power consumption of the device in watts.",
+            "peak_usage": "Peak power consumption of the device in watts.",
+            "daily_runtime": "How many minutes the device should run each day.",
+            "deadline": "Time by which the daily runtime must be completed.",
+            "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority devices are scheduled into cheaper slots first.",
+            "min_cycle_time": "Minimum time in minutes the device must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure switch device",
+          "description": "Update the switch device configuration.",
+          "data": {
+            "name": "Name",
+            "switch_entity": "Switch entity",
+            "power_sensor": "Power sensor",
+            "peak_usage": "Peak power usage",
+            "daily_runtime": "Required daily runtime",
+            "deadline": "Deadline",
+            "priority": "Priority",
+            "min_cycle_time": "Minimum cycle time"
+          },
+          "data_description": {
+            "switch_entity": "Switch or input_boolean entity that controls the device.",
+            "power_sensor": "Sensor entity that reports the current power consumption of the device in watts.",
+            "peak_usage": "Peak power consumption of the device in watts.",
+            "daily_runtime": "How many minutes the device should run each day.",
+            "deadline": "Time by which the daily runtime must be completed.",
+            "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority devices are scheduled into cheaper slots first.",
+            "min_cycle_time": "Minimum time in minutes the device must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable."
+          }
+        }
+      },
+      "abort": {
+        "reconfigure_successful": "Switch device reconfigured successfully"
+      }
+    }
+  },
+  "selector": {
+    "energy_provider": {
+      "options": {
+        "tibber": "Tibber"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "current_energy_price": {
+        "name": "Current energy price"
+      },
+      "next_slot_price": {
+        "name": "Next slot price"
+      },
+      "recommended_inverter_output": {
+        "name": "Recommended inverter output"
+      },
+      "switch_device_remaining_runtime": {
+        "name": "{device_name} remaining runtime"
+      }
+    },
+    "binary_sensor": {
+      "negative_energy_price": {
+        "name": "Negative energy price"
+      },
+      "device_schedule": {
+        "name": "{device_name} schedule"
+      }
+    }
+  }
+}
