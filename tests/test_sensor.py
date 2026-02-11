@@ -14,6 +14,7 @@ from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.zeus.const import (
+    CONF_ACCESS_TOKEN,
     CONF_DAILY_RUNTIME,
     CONF_DEADLINE,
     CONF_ENERGY_PROVIDER,
@@ -33,25 +34,58 @@ from custom_components.zeus.const import (
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
 )
+from custom_components.zeus.tibber_api import TibberHome, TibberPriceEntry
+
+from .conftest import FAKE_TOKEN
 
 
-def _make_price_response() -> dict:
-    """Create a mock Tibber price response covering the current slot."""
+def _make_tibber_api_response() -> dict[str, TibberHome]:
+    """Create a mock TibberApiClient.async_get_prices() response for sensor tests."""
     now = dt_util.now()
     minutes = (now.minute // 15) * 15
     aligned = now.replace(minute=minutes, second=0, microsecond=0)
 
-    slots = []
+    prices = []
     for i in range(8):
         slot_time = aligned + timedelta(minutes=15 * i)
-        slots.append(
-            {
-                "start_time": slot_time.isoformat(),
-                "price": 0.25,
-            }
+        prices.append(
+            TibberPriceEntry(
+                start_time=slot_time,
+                energy=0.20,
+                tax=0.05,
+                total=0.25,
+                level="NORMAL",
+                currency="EUR",
+            )
         )
 
-    return {"prices": {"Test Home": slots}}
+    return {
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=prices,
+        )
+    }
+
+
+def _patch_tibber_client(response: dict[str, TibberHome] | None = None):
+    """Create a context manager that patches TibberApiClient."""
+    if response is None:
+        response = _make_tibber_api_response()
+    mock_client = AsyncMock()
+    mock_client.async_get_prices = AsyncMock(return_value=response)
+    return patch(
+        "custom_components.zeus.coordinator.TibberApiClient",
+        return_value=mock_client,
+    )
+
+
+def _entry_data() -> dict:
+    """Return default entry data with access token."""
+    return {
+        CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER,
+        CONF_ACCESS_TOKEN: FAKE_TOKEN,
+    }
 
 
 async def test_recommended_output_sensor_with_forecast(
@@ -61,7 +95,7 @@ async def test_recommended_output_sensor_with_forecast(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
         subentries_data=[
             {
@@ -98,13 +132,7 @@ async def test_recommended_output_sensor_with_forecast(
     hass.states.async_set("sensor.solar_production", "3000")
     hass.states.async_set("sensor.home_energy_usage", "1500")
 
-    response = _make_price_response()
-
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    with _patch_tibber_client():
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -136,7 +164,7 @@ async def test_recommended_output_sensor_without_forecast(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
         subentries_data=[
             {
@@ -157,13 +185,7 @@ async def test_recommended_output_sensor_without_forecast(
 
     hass.states.async_set("sensor.solar_production", "3000")
 
-    response = _make_price_response()
-
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    with _patch_tibber_client():
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -183,7 +205,7 @@ async def test_entities_grouped_under_single_device(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
         subentries_data=[
             {
@@ -203,13 +225,7 @@ async def test_entities_grouped_under_single_device(
 
     hass.states.async_set("sensor.solar_production", "3000")
 
-    response = _make_price_response()
-
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    with _patch_tibber_client():
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -242,18 +258,12 @@ async def test_entry_reloads_on_subentry_change(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
     )
     entry.add_to_hass(hass)
 
-    response = _make_price_response()
-
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    with _patch_tibber_client():
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -264,11 +274,7 @@ async def test_entry_reloads_on_subentry_change(
     # Simulate adding a solar inverter subentry which triggers reload
     hass.states.async_set("sensor.solar_production", "3000")
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    with _patch_tibber_client():
         hass.config_entries.async_add_subentry(
             entry,
             ConfigSubentry(
@@ -300,7 +306,7 @@ async def test_device_schedule_binary_sensor_created(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
         subentries_data=[
             {
@@ -325,14 +331,8 @@ async def test_device_schedule_binary_sensor_created(
     hass.states.async_set("switch.washing_machine", "off")
     hass.states.async_set("sensor.washing_machine_power", "0")
 
-    response = _make_price_response()
-
     with (
-        patch(
-            "homeassistant.core.ServiceRegistry.async_call",
-            new_callable=AsyncMock,
-            return_value=response,
-        ),
+        _patch_tibber_client(),
         patch(
             "custom_components.zeus.scheduler.async_get_runtime_today_minutes",
             new_callable=AsyncMock,
@@ -364,6 +364,7 @@ async def test_device_schedule_binary_sensor_created(
     ent_reg = er.async_get(hass)
     schedule_ent = ent_reg.async_get(state.entity_id)
     assert schedule_ent is not None
+    assert schedule_ent.device_id is not None
     device = dev_reg.async_get(schedule_ent.device_id)
     assert device is not None
     assert device.name == "Washing Machine"
@@ -407,7 +408,7 @@ async def test_device_schedule_sensor_links_to_existing_device(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
         subentries_data=[
             {
@@ -428,14 +429,8 @@ async def test_device_schedule_sensor_links_to_existing_device(
     )
     entry.add_to_hass(hass)
 
-    response = _make_price_response()
-
     with (
-        patch(
-            "homeassistant.core.ServiceRegistry.async_call",
-            new_callable=AsyncMock,
-            return_value=response,
-        ),
+        _patch_tibber_client(),
         patch(
             "custom_components.zeus.scheduler.async_get_runtime_today_minutes",
             new_callable=AsyncMock,
@@ -464,7 +459,7 @@ async def test_run_scheduler_service(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
         subentries_data=[
             {
@@ -488,14 +483,8 @@ async def test_run_scheduler_service(
     hass.states.async_set("switch.washing_machine", "off")
     hass.states.async_set("sensor.washing_machine_power", "0")
 
-    response = _make_price_response()
-
     with (
-        patch(
-            "homeassistant.core.ServiceRegistry.async_call",
-            new_callable=AsyncMock,
-            return_value=response,
-        ),
+        _patch_tibber_client(),
         patch(
             "custom_components.zeus.scheduler.async_get_runtime_today_minutes",
             new_callable=AsyncMock,
@@ -529,7 +518,7 @@ async def test_min_cycle_time_prevents_rapid_toggling(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
         subentries_data=[
             {
@@ -554,14 +543,8 @@ async def test_min_cycle_time_prevents_rapid_toggling(
     hass.states.async_set("switch.washing_machine", "off")
     hass.states.async_set("sensor.washing_machine_power", "0")
 
-    response = _make_price_response()
-
     with (
-        patch(
-            "homeassistant.core.ServiceRegistry.async_call",
-            new_callable=AsyncMock,
-            return_value=response,
-        ),
+        _patch_tibber_client(),
         patch(
             "custom_components.zeus.scheduler.async_get_runtime_today_minutes",
             new_callable=AsyncMock,
@@ -589,7 +572,7 @@ async def test_device_schedule_binary_sensor_has_min_cycle_time_default(
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data=_entry_data(),
         unique_id=DOMAIN,
         subentries_data=[
             {
@@ -614,14 +597,8 @@ async def test_device_schedule_binary_sensor_has_min_cycle_time_default(
     hass.states.async_set("switch.dryer", "off")
     hass.states.async_set("sensor.dryer_power", "0")
 
-    response = _make_price_response()
-
     with (
-        patch(
-            "homeassistant.core.ServiceRegistry.async_call",
-            new_callable=AsyncMock,
-            return_value=response,
-        ),
+        _patch_tibber_client(),
         patch(
             "custom_components.zeus.scheduler.async_get_runtime_today_minutes",
             new_callable=AsyncMock,

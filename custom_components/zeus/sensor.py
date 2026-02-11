@@ -68,6 +68,7 @@ async def async_setup_entry(
     # Global sensors (shared Zeus Energy Manager device)
     entities: list[SensorEntity] = [
         ZeusCurrentPriceSensor(coordinator, entry),
+        ZeusCurrentEnergyOnlyPriceSensor(coordinator, entry),
         ZeusNextSlotPriceSensor(coordinator, entry),
         ZeusSolarSurplusSensor(coordinator, entry),
         ZeusSolarSelfConsumptionRatioSensor(coordinator, entry),
@@ -132,6 +133,52 @@ class ZeusCurrentPriceSensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
         attrs: dict[str, Any] = {}
         if slot:
             attrs["slot_start"] = slot.start_time.isoformat()
+            attrs["energy_price"] = slot.energy_price
+        if self.coordinator.price_override is not None:
+            attrs["price_override"] = self.coordinator.price_override
+        self._attr_extra_state_attributes = attrs
+
+
+class ZeusCurrentEnergyOnlyPriceSensor(
+    CoordinatorEntity[PriceCoordinator], SensorEntity
+):
+    """
+    Sensor showing the current energy-only price (without tax).
+
+    This is the price relevant for grid export — what you receive or pay
+    per kWh when feeding solar back to the grid. When this goes negative
+    you are paying to export, which is when the inverter should throttle.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "current_energy_only_price"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "EUR/kWh"
+    _attr_suggested_display_precision = 4
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the energy-only price sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_current_energy_only_price"
+        self._attr_device_info = _device_info(entry)
+        self._update_from_coordinator()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._update_from_coordinator()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_from_coordinator(self) -> None:
+        """Update sensor state from coordinator data."""
+        self._attr_native_value = self.coordinator.get_current_energy_price()
+
+        slot = self.coordinator.get_current_slot()
+        attrs: dict[str, Any] = {}
+        if slot:
+            attrs["slot_start"] = slot.start_time.isoformat()
+            attrs["total_price"] = slot.price
         if self.coordinator.price_override is not None:
             attrs["price_override"] = self.coordinator.price_override
         self._attr_extra_state_attributes = attrs
@@ -219,8 +266,11 @@ class ZeusRecommendedOutputSensor(CoordinatorEntity[PriceCoordinator], SensorEnt
     @callback
     def _update_recommended_output(self) -> None:
         """Calculate the recommended inverter output percentage."""
-        # If Zeus is disabled or price is not negative, produce at full capacity
-        if not self.coordinator.enabled or not self.coordinator.is_price_negative():
+        # If Zeus is disabled or energy price is not negative, produce at full capacity
+        if (
+            not self.coordinator.enabled
+            or not self.coordinator.is_energy_price_negative()
+        ):
             self._attr_native_value = 100.0
             self._update_extra_attributes()
             return
@@ -249,7 +299,7 @@ class ZeusRecommendedOutputSensor(CoordinatorEntity[PriceCoordinator], SensorEnt
         """Update extra state attributes."""
         subentry_data = self._subentry_data
         attrs: dict[str, Any] = {
-            "price_is_negative": self.coordinator.is_price_negative(),
+            "energy_price_is_negative": self.coordinator.is_energy_price_negative(),
         }
         if self.coordinator.price_override is not None:
             attrs["price_override"] = self.coordinator.price_override

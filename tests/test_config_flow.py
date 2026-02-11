@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.zeus.const import (
+    CONF_ACCESS_TOKEN,
     CONF_DAILY_RUNTIME,
     CONF_DEADLINE,
     CONF_ENERGY_PROVIDER,
@@ -25,48 +28,75 @@ from custom_components.zeus.const import (
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
 )
+from custom_components.zeus.tibber_api import TibberAuthError
+
+FAKE_TOKEN = "test-token-123"  # noqa: S105
 
 
-def _add_tibber_entry(hass: HomeAssistant) -> None:
-    """Add a fake Tibber config entry so Zeus validation passes."""
-    tibber_entry = MockConfigEntry(domain="tibber", title="Tibber")
-    tibber_entry.add_to_hass(hass)
-
-
-async def test_user_flow(hass: HomeAssistant, mock_setup_entry) -> None:
-    """Test the user config flow."""
-    _add_tibber_entry(hass)
-
+async def test_user_flow_tibber(hass: HomeAssistant, mock_setup_entry) -> None:
+    """Test the full user config flow with Tibber authentication."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": "user"}
     )
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
+    # Select Tibber as provider — should advance to tibber_auth step
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         user_input={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
     )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "tibber_auth"
+
+    # Enter a valid token
+    with patch(
+        "custom_components.zeus.config_flow.TibberApiClient",
+    ) as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.async_validate_token.return_value = "Test User"
+        mock_client_cls.return_value = mock_client
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_ACCESS_TOKEN: FAKE_TOKEN},
+        )
+
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == "Zeus"
-    assert result["data"] == {CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER}
+    assert result["title"] == "Zeus (Test User)"
+    assert result["data"] == {
+        CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER,
+        CONF_ACCESS_TOKEN: FAKE_TOKEN,
+    }
 
 
-async def test_user_flow_provider_not_found(
+async def test_user_flow_tibber_invalid_token(
     hass: HomeAssistant, mock_setup_entry
 ) -> None:
-    """Test that selecting Tibber without it being set up shows an error."""
+    """Test Tibber auth step with an invalid token shows error."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": "user"}
     )
-    assert result["type"] is FlowResultType.FORM
-
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         user_input={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
     )
+    assert result["step_id"] == "tibber_auth"
+
+    with patch(
+        "custom_components.zeus.config_flow.TibberApiClient",
+    ) as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.async_validate_token.side_effect = TibberAuthError("bad token")
+        mock_client_cls.return_value = mock_client
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_ACCESS_TOKEN: "bad-token"},
+        )
+
     assert result["type"] is FlowResultType.FORM
-    assert result["errors"] == {"base": "provider_not_found"}
+    assert result["errors"] == {"base": "invalid_token"}
 
 
 async def test_user_flow_already_configured(

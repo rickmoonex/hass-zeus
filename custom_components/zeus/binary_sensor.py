@@ -81,12 +81,12 @@ class ZeusNegativePriceSensor(CoordinatorEntity[PriceCoordinator], BinarySensorE
             manufacturer="Zeus",
             entry_type=DeviceEntryType.SERVICE,
         )
-        self._attr_is_on = self.coordinator.is_price_negative()
+        self._attr_is_on = self.coordinator.is_energy_price_negative()
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        self._attr_is_on = self.coordinator.is_price_negative()
+        self._attr_is_on = self.coordinator.is_energy_price_negative()
         self.async_write_ha_state()
 
 

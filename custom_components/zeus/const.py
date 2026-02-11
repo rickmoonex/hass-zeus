@@ -8,6 +8,10 @@ ENERGY_PROVIDERS = [ENERGY_PROVIDER_TIBBER]
 
 # Config keys
 CONF_ENERGY_PROVIDER = "energy_provider"
+CONF_ACCESS_TOKEN = "access_token"  # noqa: S105
+
+# Tibber API
+TIBBER_API_ENDPOINT = "https://api.tibber.com/v1-beta/gql"
 
 # Solar inverter subentry config keys
 CONF_PRODUCTION_ENTITY = "production_entity"

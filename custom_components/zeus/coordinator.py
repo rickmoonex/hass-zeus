@@ -16,6 +16,7 @@ from homeassistant.core import (
     HomeAssistant,
     callback,
 )
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_utc_time_change,
@@ -24,12 +25,14 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_ACCESS_TOKEN,
     CONF_PRODUCTION_ENTITY,
     DOMAIN,
     ENERGY_PROVIDER_TIBBER,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
 )
+from .tibber_api import TibberApiClient, TibberApiError
 
 if TYPE_CHECKING:
     from .scheduler import ScheduleResult
@@ -41,10 +44,19 @@ PRICE_UPDATE_INTERVAL = timedelta(hours=1)
 
 @dataclass(frozen=True)
 class PriceSlot:
-    """Represents a single energy price time slot."""
+    """
+    Represents a single energy price time slot.
+
+    Attributes:
+        start_time: Start of the 15-minute slot.
+        price: Total price (energy + tax) — what you pay for consumption.
+        energy_price: Energy-only price — what you receive/pay for grid export.
+
+    """
 
     start_time: datetime
     price: float
+    energy_price: float
 
 
 @dataclass
@@ -81,6 +93,21 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         self.schedule_results: dict[str, ScheduleResult] = {}
         self._scheduler_module: Any | None = None
         self._enabled: bool = True
+        self._tibber_client: TibberApiClient | None = None
+
+    def _get_tibber_client(self) -> TibberApiClient:
+        """Get or create the Tibber API client."""
+        if self._tibber_client is None:
+            if self.config_entry is None:
+                msg = "No config entry available"
+                raise UpdateFailed(msg)
+            access_token = self.config_entry.data.get(CONF_ACCESS_TOKEN)
+            if not access_token:
+                msg = "No Tibber access token configured"
+                raise UpdateFailed(msg)
+            session = async_get_clientsession(self.hass)
+            self._tibber_client = TibberApiClient(session, access_token)
+        return self._tibber_client
 
     @callback
     def _async_start_slot_timer(self) -> None:
@@ -161,41 +188,34 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         return result
 
     async def _fetch_tibber_prices(self) -> dict[str, list[PriceSlot]]:
-        """Fetch prices from the Tibber integration."""
+        """Fetch prices from the Tibber API using our own client."""
+        client = self._get_tibber_client()
+
         try:
-            response: dict[str, Any] | None = await self.hass.services.async_call(
-                "tibber",
-                "get_prices",
-                blocking=True,
-                return_response=True,
-            )
-        except Exception as err:
+            homes = await client.async_get_prices()
+        except TibberApiError as err:
             msg = f"Failed to fetch Tibber prices: {err}"
             raise UpdateFailed(msg) from err
 
-        if not response or "prices" not in response:
-            msg = "No price data received from Tibber"
+        if not homes:
+            msg = "No homes returned from Tibber API"
             raise UpdateFailed(msg)
 
-        prices_data: dict[str, list[dict[str, Any]]] = response["prices"]
         now = dt_util.now()
 
-        for home_name, slots in prices_data.items():
+        for home_name, home in homes.items():
             if home_name not in self._cached_slots:
                 self._cached_slots[home_name] = {}
 
             cache = self._cached_slots[home_name]
 
-            for slot_data in slots:
-                start_time = dt_util.parse_datetime(slot_data["start_time"])
-                if start_time is None:
-                    continue
-
+            for price_entry in home.prices:
                 # Only add new slots; existing ones are immutable
-                if start_time not in cache:
-                    cache[start_time] = PriceSlot(
-                        start_time=start_time,
-                        price=float(slot_data["price"]),
+                if price_entry.start_time not in cache:
+                    cache[price_entry.start_time] = PriceSlot(
+                        start_time=price_entry.start_time,
+                        price=price_entry.total,
+                        energy_price=price_entry.energy,
                     )
 
             # Prune slots older than 1 hour ago
@@ -234,15 +254,22 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         return None
 
     def get_current_price(self) -> float | None:
-        """Get the current energy price (respects override)."""
+        """Get the current total price (energy + tax, for consumption)."""
         if self._price_override is not None:
             return self._price_override
         slot = self.get_current_slot()
         return slot.price if slot else None
 
-    def is_price_negative(self) -> bool:
-        """Check if the current price is negative (you pay to export)."""
-        price = self.get_current_price()
+    def get_current_energy_price(self) -> float | None:
+        """Get the current energy-only price (for export/feed-in decisions)."""
+        if self._price_override is not None:
+            return self._price_override
+        slot = self.get_current_slot()
+        return slot.energy_price if slot else None
+
+    def is_energy_price_negative(self) -> bool:
+        """Check if the energy-only price is negative (you pay to export)."""
+        price = self.get_current_energy_price()
         if price is None:
             return False
         return price < 0
@@ -301,7 +328,7 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         return None
 
     def get_next_slot_price(self) -> float | None:
-        """Get the price for the next 15-minute slot."""
+        """Get the total price for the next 15-minute slot."""
         slot = self.get_next_slot()
         return slot.price if slot else None
 

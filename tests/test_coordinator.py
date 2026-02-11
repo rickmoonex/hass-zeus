@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -12,34 +11,55 @@ from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.zeus.const import (
+    CONF_ACCESS_TOKEN,
     CONF_ENERGY_PROVIDER,
     DOMAIN,
     ENERGY_PROVIDER_TIBBER,
 )
 from custom_components.zeus.coordinator import PriceCoordinator
+from custom_components.zeus.tibber_api import (
+    TibberApiError,
+    TibberHome,
+    TibberPriceEntry,
+)
+
+from .conftest import FAKE_TOKEN
 
 
-def _make_response(
+def _make_api_response(
     home_name: str = "Test Home",
     base_time: datetime | None = None,
     num_slots: int = 96,
-    base_price: float = 0.25,
-) -> dict[str, Any]:
-    """Create a mock Tibber price response."""
+    base_total: float = 0.25,
+    base_energy: float = 0.20,
+) -> dict[str, TibberHome]:
+    """Create a mock TibberApiClient.async_get_prices() response."""
     if base_time is None:
         base_time = datetime(2026, 2, 9, 0, 0, 0, tzinfo=timezone(timedelta(hours=1)))
 
-    slots = []
+    prices = []
     for i in range(num_slots):
         slot_time = base_time + timedelta(minutes=15 * i)
-        slots.append(
-            {
-                "start_time": slot_time.isoformat(),
-                "price": round(base_price + (i * 0.001), 4),
-            }
+        total = round(base_total + (i * 0.001), 4)
+        energy = round(base_energy + (i * 0.0008), 4)
+        prices.append(
+            TibberPriceEntry(
+                start_time=slot_time,
+                energy=energy,
+                tax=round(total - energy, 4),
+                total=total,
+                level="NORMAL",
+                currency="EUR",
+            )
         )
 
-    return {"prices": {home_name: slots}}
+    return {
+        home_name: TibberHome(
+            home_id="home-123",
+            name=home_name,
+            prices=prices,
+        )
+    }
 
 
 @pytest.fixture
@@ -48,11 +68,29 @@ def mock_entry(hass: HomeAssistant) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Zeus",
-        data={CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER},
+        data={
+            CONF_ENERGY_PROVIDER: ENERGY_PROVIDER_TIBBER,
+            CONF_ACCESS_TOKEN: FAKE_TOKEN,
+        },
         unique_id=DOMAIN,
     )
     entry.add_to_hass(hass)
     return entry
+
+
+def _patch_tibber_client(mock_client: AsyncMock):
+    """Patch TibberApiClient constructor to return our mock."""
+    return patch(
+        "custom_components.zeus.coordinator.TibberApiClient",
+        return_value=mock_client,
+    )
+
+
+def _make_mock_client(response: dict[str, TibberHome]) -> AsyncMock:
+    """Create a mock TibberApiClient with the given response."""
+    mock_client = AsyncMock()
+    mock_client.async_get_prices = AsyncMock(return_value=response)
+    return mock_client
 
 
 async def test_coordinator_fetches_tibber_prices(
@@ -60,15 +98,11 @@ async def test_coordinator_fetches_tibber_prices(
 ) -> None:
     """Test that the coordinator fetches and parses Tibber prices."""
     now = dt_util.now()
-    # Use current time as base so slots aren't pruned
     base_time = now.replace(minute=0, second=0, microsecond=0)
-    response = _make_response(base_time=base_time, num_slots=96)
+    response = _make_api_response(base_time=base_time, num_slots=96)
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
@@ -83,17 +117,18 @@ async def test_coordinator_caches_existing_slots(
 ) -> None:
     """Test that existing price slots are not overwritten on refresh."""
     now = dt_util.now()
-    # Use current time as base so slots aren't pruned
     base_time = now.replace(minute=0, second=0, microsecond=0)
-    response1 = _make_response(base_time=base_time, num_slots=8, base_price=0.25)
-    response2 = _make_response(base_time=base_time, num_slots=8, base_price=0.50)
+    response1 = _make_api_response(
+        base_time=base_time, num_slots=8, base_total=0.25, base_energy=0.20
+    )
+    response2 = _make_api_response(
+        base_time=base_time, num_slots=8, base_total=0.50, base_energy=0.40
+    )
 
-    mock_call = AsyncMock(side_effect=[response1, response2])
+    mock_client = AsyncMock()
+    mock_client.async_get_prices = AsyncMock(side_effect=[response1, response2])
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        mock_call,
-    ):
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
@@ -114,17 +149,13 @@ async def test_coordinator_get_current_price(
 ) -> None:
     """Test getting the current price slot."""
     now = dt_util.now()
-    # Align to 15-min boundary
     minutes = (now.minute // 15) * 15
     aligned = now.replace(minute=minutes, second=0, microsecond=0)
 
-    response = _make_response(base_time=aligned - timedelta(hours=1), num_slots=16)
+    response = _make_api_response(base_time=aligned - timedelta(hours=1), num_slots=16)
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
@@ -132,65 +163,100 @@ async def test_coordinator_get_current_price(
     assert current_price is not None
 
 
-async def test_coordinator_negative_price_detection(
+async def test_coordinator_get_current_energy_price(
     hass: HomeAssistant, mock_entry: MockConfigEntry
 ) -> None:
-    """Test negative price detection."""
+    """Test getting the current energy-only price."""
     now = dt_util.now()
     minutes = (now.minute // 15) * 15
     aligned = now.replace(minute=minutes, second=0, microsecond=0)
 
-    # Create a response where the current slot has a negative price
-    response = {
-        "prices": {
-            "Test Home": [
-                {
-                    "start_time": aligned.isoformat(),
-                    "price": -0.05,
-                }
-            ]
-        }
-    }
+    response = _make_api_response(base_time=aligned - timedelta(hours=1), num_slots=16)
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
-    assert coordinator.is_price_negative() is True
+    energy_price = coordinator.get_current_energy_price()
+    assert energy_price is not None
+    # Energy price should be less than total price (no tax)
+    total_price = coordinator.get_current_price()
+    assert total_price is not None
+    assert energy_price < total_price
 
 
-async def test_coordinator_positive_price(
+async def test_coordinator_negative_energy_price_detection(
     hass: HomeAssistant, mock_entry: MockConfigEntry
 ) -> None:
-    """Test that positive prices are correctly identified."""
+    """Test negative energy price detection."""
+    now = dt_util.now()
+    minutes = (now.minute // 15) * 15
+    aligned = now.replace(minute=minutes, second=0, microsecond=0)
+
+    # Create a response where the current slot has a negative energy price
+    # but a positive total price (tax keeps total above zero)
+    response = {
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=[
+                TibberPriceEntry(
+                    start_time=aligned,
+                    energy=-0.05,
+                    tax=0.08,
+                    total=0.03,  # positive total, negative energy
+                    level="VERY_CHEAP",
+                    currency="EUR",
+                ),
+            ],
+        )
+    }
+
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
+        coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
+        await coordinator.async_refresh()
+
+    # Energy price is negative → should throttle inverter
+    assert coordinator.is_energy_price_negative() is True
+    # But total price is positive
+    current_price = coordinator.get_current_price()
+    assert current_price is not None
+    assert current_price > 0
+
+
+async def test_coordinator_positive_energy_price(
+    hass: HomeAssistant, mock_entry: MockConfigEntry
+) -> None:
+    """Test that positive energy prices are correctly identified."""
     now = dt_util.now()
     minutes = (now.minute // 15) * 15
     aligned = now.replace(minute=minutes, second=0, microsecond=0)
 
     response = {
-        "prices": {
-            "Test Home": [
-                {
-                    "start_time": aligned.isoformat(),
-                    "price": 0.25,
-                }
-            ]
-        }
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=[
+                TibberPriceEntry(
+                    start_time=aligned,
+                    energy=0.20,
+                    tax=0.05,
+                    total=0.25,
+                    level="NORMAL",
+                    currency="EUR",
+                ),
+            ],
+        )
     }
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
-    assert coordinator.is_price_negative() is False
+    assert coordinator.is_energy_price_negative() is False
 
 
 async def test_coordinator_next_slot_price(
@@ -201,24 +267,31 @@ async def test_coordinator_next_slot_price(
     minutes = (now.minute // 15) * 15
     aligned = now.replace(minute=minutes, second=0, microsecond=0)
 
-    # Create 3 slots: current + 2 future
-    slots = []
+    prices = []
     for i in range(3):
         slot_time = aligned + timedelta(minutes=15 * i)
-        slots.append(
-            {
-                "start_time": slot_time.isoformat(),
-                "price": 0.10 * (i + 1),  # 0.10, 0.20, 0.30
-            }
+        total = 0.10 * (i + 1)  # 0.10, 0.20, 0.30
+        prices.append(
+            TibberPriceEntry(
+                start_time=slot_time,
+                energy=total * 0.8,
+                tax=total * 0.2,
+                total=total,
+                level="NORMAL",
+                currency="EUR",
+            )
         )
 
-    response = {"prices": {"Test Home": slots}}
+    response = {
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=prices,
+        )
+    }
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
@@ -228,15 +301,16 @@ async def test_coordinator_next_slot_price(
     assert abs(next_price - 0.20) < 0.001
 
 
-async def test_coordinator_handles_service_error(
+async def test_coordinator_handles_api_error(
     hass: HomeAssistant, mock_entry: MockConfigEntry
 ) -> None:
-    """Test that the coordinator handles service call errors gracefully."""
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        side_effect=Exception("Service unavailable"),
-    ):
+    """Test that the coordinator handles API errors gracefully."""
+    mock_client = AsyncMock()
+    mock_client.async_get_prices = AsyncMock(
+        side_effect=TibberApiError("Connection failed")
+    )
+
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
@@ -248,11 +322,9 @@ async def test_coordinator_handles_empty_response(
     hass: HomeAssistant, mock_entry: MockConfigEntry
 ) -> None:
     """Test that the coordinator handles empty responses gracefully."""
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value={},
-    ):
+    mock_client = _make_mock_client({})  # No homes returned
+
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
@@ -278,39 +350,45 @@ async def test_coordinator_price_override(
     aligned = now.replace(minute=minutes, second=0, microsecond=0)
 
     response = {
-        "prices": {
-            "Test Home": [
-                {
-                    "start_time": aligned.isoformat(),
-                    "price": 0.25,
-                }
-            ]
-        }
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=[
+                TibberPriceEntry(
+                    start_time=aligned,
+                    energy=0.20,
+                    tax=0.05,
+                    total=0.25,
+                    level="NORMAL",
+                    currency="EUR",
+                ),
+            ],
+        )
     }
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
-    # Real price should be 0.25
+    # Real prices
     assert coordinator.get_current_price() == 0.25
-    assert coordinator.is_price_negative() is False
+    assert coordinator.get_current_energy_price() == 0.20
+    assert coordinator.is_energy_price_negative() is False
     assert coordinator.price_override is None
 
-    # Set override to negative price
+    # Set override to negative price — affects both getters
     coordinator.async_set_price_override(-0.05)
     assert coordinator.get_current_price() == -0.05
-    assert coordinator.is_price_negative() is True
+    assert coordinator.get_current_energy_price() == -0.05
+    assert coordinator.is_energy_price_negative() is True
     assert coordinator.price_override == -0.05
 
-    # Clear override, back to real price
+    # Clear override, back to real prices
     coordinator.async_clear_price_override()
     assert coordinator.get_current_price() == 0.25
-    assert coordinator.is_price_negative() is False
+    assert coordinator.get_current_energy_price() == 0.20
+    assert coordinator.is_energy_price_negative() is False
     assert coordinator.price_override is None
 
 
@@ -323,25 +401,65 @@ async def test_coordinator_price_override_zero(
     aligned = now.replace(minute=minutes, second=0, microsecond=0)
 
     response = {
-        "prices": {
-            "Test Home": [
-                {
-                    "start_time": aligned.isoformat(),
-                    "price": 0.25,
-                }
-            ]
-        }
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=[
+                TibberPriceEntry(
+                    start_time=aligned,
+                    energy=0.20,
+                    tax=0.05,
+                    total=0.25,
+                    level="NORMAL",
+                    currency="EUR",
+                ),
+            ],
+        )
     }
 
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_call",
-        new_callable=AsyncMock,
-        return_value=response,
-    ):
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
     # Override to exactly 0
     coordinator.async_set_price_override(0.0)
     assert coordinator.get_current_price() == 0.0
-    assert coordinator.is_price_negative() is False
+    assert coordinator.get_current_energy_price() == 0.0
+    assert coordinator.is_energy_price_negative() is False
+
+
+async def test_coordinator_energy_price_stored_in_slots(
+    hass: HomeAssistant, mock_entry: MockConfigEntry
+) -> None:
+    """Test that both price and energy_price are correctly stored in PriceSlot."""
+    now = dt_util.now()
+    minutes = (now.minute // 15) * 15
+    aligned = now.replace(minute=minutes, second=0, microsecond=0)
+
+    response = {
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=[
+                TibberPriceEntry(
+                    start_time=aligned,
+                    energy=0.18,
+                    tax=0.07,
+                    total=0.25,
+                    level="NORMAL",
+                    currency="EUR",
+                ),
+            ],
+        )
+    }
+
+    mock_client = _make_mock_client(response)
+    with _patch_tibber_client(mock_client):
+        coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
+        await coordinator.async_refresh()
+
+    slot = coordinator.get_current_slot()
+    assert slot is not None
+    assert slot.price == 0.25  # total
+    assert slot.energy_price == 0.18  # energy only

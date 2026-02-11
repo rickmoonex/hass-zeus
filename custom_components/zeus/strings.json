@@ -10,11 +10,21 @@
         "data_description": {
           "energy_provider": "Select the integration to use for fetching energy prices."
         }
+      },
+      "tibber_auth": {
+        "title": "Authenticate with Tibber",
+        "description": "Enter your Tibber personal access token. You can create one at [developer.tibber.com](https://developer.tibber.com/settings/access-token).",
+        "data": {
+          "access_token": "Access token"
+        },
+        "data_description": {
+          "access_token": "Your Tibber personal access token (PAT)."
+        }
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the energy provider",
-      "provider_not_found": "The selected energy provider integration is not set up. Please set up {provider} first.",
+      "cannot_connect": "Failed to connect to the Tibber API",
+      "invalid_token": "Invalid access token. Please check your Tibber personal access token.",
       "unknown": "Unexpected error"
     },
     "abort": {
@@ -178,6 +188,9 @@
     "sensor": {
       "current_energy_price": {
         "name": "Current energy price"
+      },
+      "current_energy_only_price": {
+        "name": "Current energy-only price"
       },
       "next_slot_price": {
         "name": "Next slot price"

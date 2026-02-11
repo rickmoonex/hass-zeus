@@ -21,6 +21,7 @@ def _make_slots(
         PriceSlot(
             start_time=base + timedelta(minutes=15 * i),
             price=base_price + (i * 0.01),
+            energy_price=(base_price + (i * 0.01)) * 0.8,
         )
         for i in range(count)
     ]
@@ -158,8 +159,8 @@ def test_scheduler_priority_tiebreaker_with_solar() -> None:
 
     # Two slots: 10:00 at 0.30 EUR, 10:15 at 0.05 EUR
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_1015, price=0.05),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.05, energy_price=0.04),
     ]
 
     # Solar forecast: 1500 Wh at 10:00 hour only, consumption 500W
@@ -201,8 +202,8 @@ def test_scheduler_concurrent_devices_share_solar() -> None:
 
     # Two slots: 10:00 at 0.30, 10:15 at 0.25
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_1015, price=0.25),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.25, energy_price=0.2),
     ]
 
     # Solar: 2500 Wh at 10:00, consumption 500W → surplus 2000W
@@ -252,8 +253,8 @@ def test_scheduler_solar_bonus_affects_scoring() -> None:
     slot_11 = datetime(2026, 2, 9, 11, 0, 0, tzinfo=TZ)
     # Two slots at different hours: 10:00 at 0.30 EUR, 11:00 at 0.20 EUR
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_11, price=0.20),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_11, price=0.20, energy_price=0.16),
     ]
 
     # Solar forecast: lots of sun at 10:00 hour only
@@ -280,8 +281,12 @@ def test_scheduler_waiting_for_cheaper_slot() -> None:
     now = datetime(2026, 2, 9, 10, 0, 0, tzinfo=TZ)
     # Current slot expensive, later slot cheap
     slots = [
-        PriceSlot(start_time=now, price=0.50),
-        PriceSlot(start_time=now + timedelta(minutes=15), price=0.01),
+        PriceSlot(start_time=now, price=0.50, energy_price=0.4),
+        PriceSlot(
+            start_time=now + timedelta(minutes=15),
+            price=0.01,
+            energy_price=0.008,
+        ),
     ]
 
     device = _make_device(daily_runtime_min=15.0)  # 1 slot needed
@@ -302,10 +307,22 @@ def test_scheduler_deadline_pressure_multiple_devices() -> None:
     """
     now = datetime(2026, 2, 9, 22, 0, 0, tzinfo=TZ)
     slots = [
-        PriceSlot(start_time=now, price=0.50),
-        PriceSlot(start_time=now + timedelta(minutes=15), price=0.10),
-        PriceSlot(start_time=now + timedelta(minutes=30), price=0.05),
-        PriceSlot(start_time=now + timedelta(minutes=45), price=0.03),
+        PriceSlot(start_time=now, price=0.50, energy_price=0.4),
+        PriceSlot(
+            start_time=now + timedelta(minutes=15),
+            price=0.10,
+            energy_price=0.08,
+        ),
+        PriceSlot(
+            start_time=now + timedelta(minutes=30),
+            price=0.05,
+            energy_price=0.04,
+        ),
+        PriceSlot(
+            start_time=now + timedelta(minutes=45),
+            price=0.03,
+            energy_price=0.024,
+        ),
     ]
 
     # Device A: needs 30 min, deadline at 22:30 → only 2 slots → forced
@@ -347,8 +364,10 @@ def test_scheduler_global_optimisation_over_greedy() -> None:
     """
     now = datetime(2026, 2, 9, 10, 0, 0, tzinfo=TZ)
     slots = [
-        PriceSlot(start_time=now, price=0.01),
-        PriceSlot(start_time=now + timedelta(minutes=15), price=0.20),
+        PriceSlot(start_time=now, price=0.01, energy_price=0.008),
+        PriceSlot(
+            start_time=now + timedelta(minutes=15), price=0.20, energy_price=0.16
+        ),
     ]
 
     dev_a = _make_device(
@@ -379,8 +398,8 @@ def test_live_solar_surplus_activates_device() -> None:
 
     # 10:00 at 0.30 EUR, 10:15 at 0.05 EUR
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_1015, price=0.05),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.05, energy_price=0.04),
     ]
 
     # Forecast: only 1000 Wh at 10:00, consumption 500W → surplus 500W
@@ -420,8 +439,8 @@ def test_live_solar_surplus_ignored_when_below_forecast() -> None:
 
     # Two slots so the device has a choice (avoids deadline pressure)
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_1015, price=0.25),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.25, energy_price=0.2),
     ]
 
     # Forecast: 3000 Wh at 10:00, consumption 500W → surplus 2500W
@@ -454,8 +473,8 @@ def test_live_solar_shared_between_devices() -> None:
     slot_1015 = now + timedelta(minutes=15)
 
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_1015, price=0.05),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.05, energy_price=0.04),
     ]
 
     # No forecast at all — purely live solar
@@ -501,8 +520,8 @@ def test_actual_usage_frees_solar_for_other_devices() -> None:
     slot_1015 = now + timedelta(minutes=15)
 
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_1015, price=0.25),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.25, energy_price=0.2),
     ]
 
     # Solar: 2500 Wh, consumption 500W → surplus 2000W
@@ -565,8 +584,8 @@ def test_feed_in_rate_prefers_export_over_cheap_device() -> None:
     slot_1015 = now + timedelta(minutes=15)
 
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_1015, price=0.02),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.02, energy_price=0.016),
     ]
 
     # Solar: 2000 Wh, consumption 500W → surplus 1500W (fully covers 1000W)
@@ -619,8 +638,8 @@ def test_forecast_bias_correction_scales_future_slots() -> None:
     slot_11 = datetime(2026, 2, 9, 11, 0, 0, tzinfo=TZ)
 
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_11, price=0.30),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_11, price=0.30, energy_price=0.24),
     ]
 
     # Forecast: 1500 Wh at both hours, consumption 500W → surplus 1000W each
@@ -670,8 +689,8 @@ def test_live_solar_peak_must_fit_fully() -> None:
     slot_1015 = now + timedelta(minutes=15)
 
     slots = [
-        PriceSlot(start_time=now, price=0.30),
-        PriceSlot(start_time=slot_1015, price=0.02),
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.02, energy_price=0.016),
     ]
 
     device = _make_device(daily_runtime_min=15.0, peak_usage_w=1000.0)
