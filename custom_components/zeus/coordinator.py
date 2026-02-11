@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -21,27 +23,39 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_utc_time_change,
 )
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_ACCESS_TOKEN,
+    CONF_CYCLE_DURATION,
+    CONF_POWER_SENSOR,
     CONF_PRODUCTION_ENTITY,
+    CONF_SWITCH_ENTITY,
     CONF_TEMPERATURE_SENSOR,
     DOMAIN,
     ENERGY_PROVIDER_TIBBER,
+    SLOT_DURATION_MIN,
+    SUBENTRY_MANUAL_DEVICE,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
     SUBENTRY_THERMOSTAT_DEVICE,
 )
+from .thermal_model import ThermalTracker
 from .tibber_api import TibberApiClient, TibberApiError
 
 if TYPE_CHECKING:
-    from .scheduler import ScheduleResult
+    from .scheduler import ManualDeviceRanking, ScheduleResult
 
 _LOGGER = logging.getLogger(__name__)
 
 PRICE_UPDATE_INTERVAL = timedelta(hours=1)
+THERMAL_STORAGE_KEY = "zeus_thermal_trackers"
+THERMAL_STORAGE_VERSION = 1
+
+RESERVATION_STORAGE_KEY = "zeus_manual_reservations"
+RESERVATION_STORAGE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -97,6 +111,16 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         self._scheduler_module: Any | None = None
         self._enabled: bool = True
         self._tibber_client: TibberApiClient | None = None
+        self._thermal_trackers: dict[str, ThermalTracker] = {}
+        self._thermal_store: Store[dict[str, Any]] = Store(
+            hass, THERMAL_STORAGE_VERSION, THERMAL_STORAGE_KEY
+        )
+        self._thermal_unsub: CALLBACK_TYPE | None = None
+        self._manual_reservations: dict[str, tuple[datetime, datetime]] = {}
+        self._reservation_store: Store[dict[str, Any]] = Store(
+            hass, RESERVATION_STORAGE_VERSION, RESERVATION_STORAGE_KEY
+        )
+        self.manual_device_results: dict[str, ManualDeviceRanking] = {}
 
     def _get_tibber_client(self) -> TibberApiClient:
         """Get or create the Tibber API client."""
@@ -205,6 +229,234 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
             self._temp_unsub()
             self._temp_unsub = None
 
+    # ------------------------------------------------------------------
+    # Thermal tracker management
+    # ------------------------------------------------------------------
+
+    async def async_restore_thermal_trackers(self) -> None:
+        """Restore thermal tracker state from storage."""
+        stored: dict[str, Any] | None = await self._thermal_store.async_load()
+        if stored:
+            for subentry_id, tracker_data in stored.items():
+                self._thermal_trackers[subentry_id] = ThermalTracker.from_dict(
+                    tracker_data
+                )
+            _LOGGER.debug(
+                "Restored %d thermal trackers from storage",
+                len(self._thermal_trackers),
+            )
+
+    async def async_save_thermal_trackers(self) -> None:
+        """Persist thermal tracker state to storage."""
+        data = {
+            sid: tracker.to_dict() for sid, tracker in self._thermal_trackers.items()
+        }
+        await self._thermal_store.async_save(data)
+
+    async def async_restore_reservations(self) -> None:
+        """Restore manual device reservations from storage."""
+        stored: dict[str, Any] | None = await self._reservation_store.async_load()
+        if stored:
+            now = dt_util.now()
+            for sid, item in stored.items():
+                try:
+                    start = datetime.fromisoformat(item["start"])
+                    end = datetime.fromisoformat(item["end"])
+                    if end > now:  # Only restore non-expired reservations
+                        self._manual_reservations[sid] = (start, end)
+                except (KeyError, ValueError, TypeError):
+                    continue
+            _LOGGER.debug(
+                "Restored %d manual reservations from storage",
+                len(self._manual_reservations),
+            )
+
+    async def async_save_reservations(self) -> None:
+        """Persist manual device reservations to storage."""
+        data = {
+            sid: {"start": start.isoformat(), "end": end.isoformat()}
+            for sid, (start, end) in self._manual_reservations.items()
+        }
+        await self._reservation_store.async_save(data)
+
+    def get_thermal_tracker(self, subentry_id: str) -> ThermalTracker | None:
+        """Get the thermal tracker for a thermostat subentry."""
+        return self._thermal_trackers.get(subentry_id)
+
+    def _ensure_thermal_tracker(self, subentry_id: str) -> ThermalTracker:
+        """Get or create a thermal tracker for a subentry."""
+        if subentry_id not in self._thermal_trackers:
+            self._thermal_trackers[subentry_id] = ThermalTracker()
+        return self._thermal_trackers[subentry_id]
+
+    @callback
+    def _async_start_thermal_listener(self) -> None:
+        """Listen for thermostat switch state changes to track heating sessions."""
+        if self._thermal_unsub is not None or self.config_entry is None:
+            return
+
+        # Build a mapping: switch_entity_id -> (subentry_id, temp_sensor, power_sensor)
+        switch_map: dict[str, tuple[str, str, str]] = {}
+        for subentry in self.config_entry.subentries.values():
+            if subentry.subentry_type != SUBENTRY_THERMOSTAT_DEVICE:
+                continue
+            sw = subentry.data.get(CONF_SWITCH_ENTITY)
+            ts = subentry.data.get(CONF_TEMPERATURE_SENSOR)
+            ps = subentry.data.get(CONF_POWER_SENSOR)
+            if sw and ts and ps:
+                switch_map[sw] = (subentry.subentry_id, ts, ps)
+
+        if not switch_map:
+            return
+
+        @callback
+        def _on_switch_change(
+            event: Event[EventStateChangedData],
+        ) -> None:
+            """Track heater on/off transitions for thermal learning."""
+            entity_id = event.data["entity_id"]
+            old_state = event.data.get("old_state")
+            new_state = event.data.get("new_state")
+
+            if entity_id not in switch_map or old_state is None or new_state is None:
+                return
+
+            subentry_id, temp_sensor, power_sensor = switch_map[entity_id]
+            tracker = self._ensure_thermal_tracker(subentry_id)
+            now = dt_util.utcnow()
+
+            # Read current temperature
+            temp_state = self.hass.states.get(temp_sensor)
+            current_temp: float | None = None
+            if temp_state and temp_state.state not in ("unknown", "unavailable"):
+                with contextlib.suppress(ValueError, TypeError):
+                    current_temp = float(temp_state.state)
+
+            was_on = old_state.state == "on"
+            is_on = new_state.state == "on"
+
+            if not was_on and is_on and current_temp is not None:
+                # Heater turned ON
+                tracker.on_heater_started(current_temp, now)
+                _LOGGER.debug(
+                    "Thermal session started for %s at %.1f°C",
+                    entity_id,
+                    current_temp,
+                )
+
+            elif was_on and not is_on and current_temp is not None:
+                # Heater turned OFF — read average power
+                avg_power: float = 0.0
+                pw_state = self.hass.states.get(power_sensor)
+                if pw_state and pw_state.state not in ("unknown", "unavailable"):
+                    with contextlib.suppress(ValueError, TypeError):
+                        avg_power = float(pw_state.state)
+
+                tracker.on_heater_stopped(current_temp, avg_power, now)
+                _LOGGER.debug(
+                    "Thermal session ended for %s at %.1f°C (power=%.0fW)",
+                    entity_id,
+                    current_temp,
+                    avg_power,
+                )
+
+                # Persist after each completed session
+                self.hass.async_create_task(self.async_save_thermal_trackers())
+
+        self._thermal_unsub = async_track_state_change_event(
+            self.hass, list(switch_map.keys()), _on_switch_change
+        )
+
+    @callback
+    def _async_stop_thermal_listener(self) -> None:
+        """Stop listening for thermostat switch changes."""
+        if self._thermal_unsub is not None:
+            self._thermal_unsub()
+            self._thermal_unsub = None
+
+    # ------------------------------------------------------------------
+    # Manual device reservation management
+    # ------------------------------------------------------------------
+
+    async def async_reserve_manual_device(
+        self,
+        subentry_id: str,
+        start_time: datetime | None = None,
+    ) -> None:
+        """
+        Reserve a time window for a manual device.
+
+        If ``start_time`` is None, uses the #1 recommended window from the
+        latest ranking results. Triggers a scheduler rerun so smart devices
+        plan around the reservation.
+        """
+        if start_time is None:
+            ranking = self.manual_device_results.get(subentry_id)
+            if (
+                not ranking
+                or not ranking.recommended_start
+                or not ranking.recommended_end
+            ):
+                _LOGGER.warning(
+                    "Cannot reserve %s: no recommended window available", subentry_id
+                )
+                return
+            start = ranking.recommended_start
+            end = ranking.recommended_end
+        else:
+            # Find the matching request to compute end time from cycle_duration
+            if self.config_entry is None:
+                return
+            subentry = self.config_entry.subentries.get(subentry_id)
+            if subentry is None:
+                return
+            cycle_min = float(subentry.data.get(CONF_CYCLE_DURATION, 0))
+            if cycle_min <= 0:
+                return
+            start = start_time
+            slots_needed = math.ceil(cycle_min / SLOT_DURATION_MIN)
+            end = start + timedelta(minutes=slots_needed * SLOT_DURATION_MIN)
+
+        self._manual_reservations[subentry_id] = (start, end)
+        _LOGGER.info(
+            "Reserved manual device %s: %s -> %s",
+            subentry_id,
+            start.isoformat(),
+            end.isoformat(),
+        )
+
+        await self.async_save_reservations()
+
+        # Rerun scheduler so smart devices see the reservation
+        await self.async_run_scheduler()
+        if self.data is not None:
+            self.async_set_updated_data(self.data)
+
+    async def async_cancel_reservation(self, subentry_id: str) -> None:
+        """Cancel a manual device reservation."""
+        if subentry_id in self._manual_reservations:
+            del self._manual_reservations[subentry_id]
+            _LOGGER.info("Cancelled reservation for %s", subentry_id)
+            await self.async_save_reservations()
+            await self.async_run_scheduler()
+            if self.data is not None:
+                self.async_set_updated_data(self.data)
+
+    def get_reservation(self, subentry_id: str) -> tuple[datetime, datetime] | None:
+        """Get the active reservation for a manual device, or None."""
+        return self._manual_reservations.get(subentry_id)
+
+    def get_active_reservations(self) -> dict[str, tuple[datetime, datetime]]:
+        """Return all non-expired reservations, pruning expired ones."""
+        now = dt_util.now()
+        expired = [
+            sid for sid, (_, end) in self._manual_reservations.items() if end <= now
+        ]
+        for sid in expired:
+            del self._manual_reservations[sid]
+            _LOGGER.debug("Reservation expired for %s", sid)
+        return dict(self._manual_reservations)
+
     async def _async_slot_update(self) -> None:
         """Run scheduler and re-notify listeners on 15-min boundary."""
         await self.async_run_scheduler()
@@ -223,6 +475,7 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         self._async_start_slot_timer()
         self._async_start_solar_listener()
         self._async_start_temperature_listener()
+        self._async_start_thermal_listener()
         return result
 
     async def _fetch_tibber_prices(self) -> dict[str, list[PriceSlot]]:
@@ -375,7 +628,12 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         if self.config_entry is None:
             return False
         return any(
-            s.subentry_type in (SUBENTRY_SWITCH_DEVICE, SUBENTRY_THERMOSTAT_DEVICE)
+            s.subentry_type
+            in (
+                SUBENTRY_SWITCH_DEVICE,
+                SUBENTRY_THERMOSTAT_DEVICE,
+                SUBENTRY_MANUAL_DEVICE,
+            )
             for s in self.config_entry.subentries.values()
         )
 
@@ -413,4 +671,7 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         self._async_stop_slot_timer()
         self._async_stop_solar_listener()
         self._async_stop_temperature_listener()
+        self._async_stop_thermal_listener()
+        await self.async_save_thermal_trackers()
+        await self.async_save_reservations()
         await super().async_shutdown()

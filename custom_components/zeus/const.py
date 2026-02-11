@@ -30,14 +30,23 @@ CONF_DAILY_RUNTIME = "daily_runtime"
 CONF_DEADLINE = "deadline"
 CONF_PRIORITY = "priority"
 CONF_MIN_CYCLE_TIME = "min_cycle_time"
+CONF_USE_ACTUAL_POWER = "use_actual_power"
 
 # Thermostat device subentry config keys
 CONF_TEMPERATURE_SENSOR = "temperature_sensor"
-CONF_TARGET_TEMPERATURE = "target_temperature"
-CONF_TEMPERATURE_MARGIN = "temperature_margin"
+CONF_TEMPERATURE_TOLERANCE = "temperature_tolerance"
+
+# Manual device subentry config keys
+CONF_CYCLE_DURATION = "cycle_duration"
+CONF_DYNAMIC_CYCLE_DURATION = "dynamic_cycle_duration"
+CONF_DELAY_INTERVALS = "delay_intervals"
+
+# Scheduler
+SLOT_DURATION_MIN = 15
 
 # Subentry types
 SUBENTRY_SOLAR_INVERTER = "solar_inverter"
 SUBENTRY_HOME_MONITOR = "home_monitor"
 SUBENTRY_SWITCH_DEVICE = "switch_device"
 SUBENTRY_THERMOSTAT_DEVICE = "thermostat_device"
+SUBENTRY_MANUAL_DEVICE = "manual_device"

@@ -3,26 +3,51 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import voluptuous as vol
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.util import dt as dt_util
 
 from .const import CONF_ENERGY_PROVIDER, DOMAIN
 from .coordinator import PriceCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.SWITCH]
+PLATFORMS: list[Platform] = [
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.CLIMATE,
+    Platform.BUTTON,
+    Platform.NUMBER,
+]
 
 SERVICE_SET_PRICE_OVERRIDE = "set_price_override"
 SERVICE_CLEAR_PRICE_OVERRIDE = "clear_price_override"
 SERVICE_RUN_SCHEDULER = "run_scheduler"
+SERVICE_RESERVE_MANUAL_DEVICE = "reserve_manual_device"
+SERVICE_CANCEL_RESERVATION = "cancel_reservation"
 
 SERVICE_SET_PRICE_OVERRIDE_SCHEMA = vol.Schema(
     {
         vol.Required("price"): vol.Coerce(float),
+    }
+)
+
+SERVICE_RESERVE_MANUAL_DEVICE_SCHEMA = vol.Schema(
+    {
+        vol.Required("subentry_id"): str,
+        vol.Optional("start_time"): str,
+    }
+)
+
+SERVICE_CANCEL_RESERVATION_SCHEMA = vol.Schema(
+    {
+        vol.Required("subentry_id"): str,
     }
 )
 
@@ -34,12 +59,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     provider = entry.data.get(CONF_ENERGY_PROVIDER, "tibber")
 
     coordinator = PriceCoordinator(hass, entry, provider)
+    await coordinator.async_restore_thermal_trackers()
+    await coordinator.async_restore_reservations()
     await coordinator.async_config_entry_first_refresh()
     await coordinator.async_run_scheduler()
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Register frontend card static path (once only, skipped in tests)
+    if hass.http is not None and not hass.data[DOMAIN].get("_card_registered"):
+        card_path = Path(__file__).parent / "www" / "zeus-scheduler-card.js"
+        await hass.http.async_register_static_paths(
+            [
+                StaticPathConfig(
+                    "/zeus/zeus-scheduler-card.js", str(card_path), cache_headers=False
+                )
+            ]
+        )
+        hass.data[DOMAIN]["_card_registered"] = True
 
     _async_register_services(hass)
 
@@ -66,6 +105,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_remove(DOMAIN, SERVICE_SET_PRICE_OVERRIDE)
         hass.services.async_remove(DOMAIN, SERVICE_CLEAR_PRICE_OVERRIDE)
         hass.services.async_remove(DOMAIN, SERVICE_RUN_SCHEDULER)
+        hass.services.async_remove(DOMAIN, SERVICE_RESERVE_MANUAL_DEVICE)
+        hass.services.async_remove(DOMAIN, SERVICE_CANCEL_RESERVATION)
 
     return unload_ok
 
@@ -78,7 +119,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
 
     def _get_coordinators() -> list[PriceCoordinator]:
         """Get all active Zeus coordinators."""
-        return list(hass.data.get(DOMAIN, {}).values())
+        return [
+            v
+            for v in hass.data.get(DOMAIN, {}).values()
+            if isinstance(v, PriceCoordinator)
+        ]
 
     async def async_handle_set_price_override(call: ServiceCall) -> None:
         """Handle the set_price_override service call."""
@@ -115,4 +160,34 @@ def _async_register_services(hass: HomeAssistant) -> None:
         DOMAIN,
         SERVICE_RUN_SCHEDULER,
         async_handle_run_scheduler,
+    )
+
+    async def async_handle_reserve_manual_device(call: ServiceCall) -> None:
+        """Handle the reserve_manual_device service call."""
+        subentry_id = call.data["subentry_id"]
+        start_time_str = call.data.get("start_time")
+        start_time = None
+        if start_time_str:
+            start_time = dt_util.parse_datetime(start_time_str)
+        for coordinator in _get_coordinators():
+            await coordinator.async_reserve_manual_device(subentry_id, start_time)
+
+    async def async_handle_cancel_reservation(call: ServiceCall) -> None:
+        """Handle the cancel_reservation service call."""
+        subentry_id = call.data["subentry_id"]
+        for coordinator in _get_coordinators():
+            await coordinator.async_cancel_reservation(subentry_id)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESERVE_MANUAL_DEVICE,
+        async_handle_reserve_manual_device,
+        schema=SERVICE_RESERVE_MANUAL_DEVICE_SCHEMA,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CANCEL_RESERVATION,
+        async_handle_cancel_reservation,
+        schema=SERVICE_CANCEL_RESERVATION_SCHEMA,
     )

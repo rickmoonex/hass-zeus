@@ -58,7 +58,7 @@ def test_scheduler_picks_cheapest_slots() -> None:
 
     device = _make_device(daily_runtime_min=30.0)  # Needs 2 slots
 
-    results = compute_schedules([device], slots, None, 0.0, now)
+    results, _ = compute_schedules([device], slots, None, 0.0, now)
 
     result = results["dev1"]
     assert result.should_be_on  # Current slot (10:00) is cheapest
@@ -78,7 +78,7 @@ def test_scheduler_runtime_already_met() -> None:
         runtime_today_min=30.0,  # Already met
     )
 
-    results = compute_schedules([device], slots, None, 0.0, now)
+    results, _ = compute_schedules([device], slots, None, 0.0, now)
 
     result = results["dev1"]
     assert not result.should_be_on
@@ -98,7 +98,7 @@ def test_scheduler_deadline_pressure_forces_on() -> None:
         deadline=time(22, 30),
     )
 
-    results = compute_schedules([device], slots, None, 0.0, now)
+    results, _ = compute_schedules([device], slots, None, 0.0, now)
 
     result = results["dev1"]
     assert result.should_be_on
@@ -129,7 +129,7 @@ def test_scheduler_priority_ordering() -> None:
         priority=10,
     )
 
-    results = compute_schedules(
+    results, _ = compute_schedules(
         [low_priority, high_priority],  # Order shouldn't matter
         slots,
         None,
@@ -180,7 +180,7 @@ def test_scheduler_priority_tiebreaker_with_solar() -> None:
         peak_usage_w=1000.0,
     )
 
-    results = compute_schedules(
+    results, _ = compute_schedules(
         [low_priority, high_priority], slots, solar_forecast, 500.0, now
     )
 
@@ -217,7 +217,7 @@ def test_scheduler_concurrent_devices_share_solar() -> None:
         subentry_id="b", daily_runtime_min=15.0, priority=2, peak_usage_w=500.0
     )
 
-    results = compute_schedules([dev_a, dev_b], slots, solar_forecast, 500.0, now)
+    results, _ = compute_schedules([dev_a, dev_b], slots, solar_forecast, 500.0, now)
 
     # Both should be on at 10:00 using shared solar
     assert results["a"].should_be_on
@@ -239,7 +239,7 @@ def test_scheduler_past_deadline_not_scheduled() -> None:
         deadline=time(23, 0),  # Already passed
     )
 
-    results = compute_schedules([device], slots, None, 0.0, now)
+    results, _ = compute_schedules([device], slots, None, 0.0, now)
 
     result = results["dev1"]
     # No slots available before deadline, so no scheduling
@@ -267,7 +267,7 @@ def test_scheduler_solar_bonus_affects_scoring() -> None:
     # Solar surplus at 10:00 = 3000 - 500 = 2500W, which covers the device's
     # 1000W peak. This makes 10:00 cost_score = -1.0, beating 11:00's 0.20.
     # Own solar is always preferred over buying from the grid.
-    results = compute_schedules([device], slots, solar_forecast, 500.0, now)
+    results, _ = compute_schedules([device], slots, solar_forecast, 500.0, now)
 
     result = results["dev1"]
     assert result.should_be_on
@@ -291,7 +291,7 @@ def test_scheduler_waiting_for_cheaper_slot() -> None:
 
     device = _make_device(daily_runtime_min=15.0)  # 1 slot needed
 
-    results = compute_schedules([device], slots, None, 0.0, now)
+    results, _ = compute_schedules([device], slots, None, 0.0, now)
 
     result = results["dev1"]
     assert not result.should_be_on  # Waits for cheaper 10:15 slot
@@ -340,7 +340,7 @@ def test_scheduler_deadline_pressure_multiple_devices() -> None:
         priority=5,
     )
 
-    results = compute_schedules([device_a, device_b], slots, None, 0.0, now)
+    results, _ = compute_schedules([device_a, device_b], slots, None, 0.0, now)
 
     assert results["a"].should_be_on
     assert "deadline pressure" in results["a"].reason.lower()
@@ -377,7 +377,7 @@ def test_scheduler_global_optimisation_over_greedy() -> None:
         subentry_id="b", daily_runtime_min=15.0, priority=5, peak_usage_w=500.0
     )
 
-    results = compute_schedules([dev_a, dev_b], slots, None, 0.0, now)
+    results, _ = compute_schedules([dev_a, dev_b], slots, None, 0.0, now)
 
     # Both devices should share the cheapest slot
     assert results["a"].should_be_on
@@ -409,12 +409,12 @@ def test_live_solar_surplus_activates_device() -> None:
     device = _make_device(daily_runtime_min=15.0, peak_usage_w=1000.0)
 
     # Without live solar: device picks 10:15 (0.05 < 0.30 partial solar)
-    results_no_live = compute_schedules([device], slots, solar_forecast, 500.0, now)
+    results_no_live, _ = compute_schedules([device], slots, solar_forecast, 500.0, now)
     assert not results_no_live["dev1"].should_be_on
     assert results_no_live["dev1"].scheduled_slots[0] == slot_1015
 
     # With live solar surplus of 2000W: covers device, 10:00 becomes free
-    results_live = compute_schedules(
+    results_live, _ = compute_schedules(
         [device],
         slots,
         solar_forecast,
@@ -449,7 +449,7 @@ def test_live_solar_surplus_ignored_when_below_forecast() -> None:
     device = _make_device(daily_runtime_min=15.0, peak_usage_w=1000.0)
 
     # Live solar is only 200W surplus (cloud) — should NOT downgrade
-    results = compute_schedules(
+    results, _ = compute_schedules(
         [device],
         slots,
         solar_forecast,
@@ -485,7 +485,7 @@ def test_live_solar_shared_between_devices() -> None:
         subentry_id="b", daily_runtime_min=15.0, priority=5, peak_usage_w=1000.0
     )
 
-    results = compute_schedules(
+    results, _ = compute_schedules(
         [dev_a, dev_b],
         slots,
         None,
@@ -535,6 +535,7 @@ def test_actual_usage_frees_solar_for_other_devices() -> None:
     # Simulate device A currently ON drawing only 200W
     dev_a.is_on = True
     dev_a.actual_usage_w = 200.0
+    dev_a.use_actual_power = True
 
     dev_b = _make_device(
         subentry_id="b", daily_runtime_min=15.0, priority=2, peak_usage_w=1000.0
@@ -551,7 +552,7 @@ def test_actual_usage_frees_solar_for_other_devices() -> None:
     # B picks 10:00 (partial solar still cheaper than 10:15 grid).
 
     # With actual usage: A consumes only 200W, leaves 1800W → B fully solar
-    results_actual = compute_schedules(
+    results_actual, _ = compute_schedules(
         [dev_a, dev_b], slots, solar_forecast, 500.0, now
     )
     assert results_actual["a"].should_be_on
@@ -589,7 +590,7 @@ def test_energy_price_opportunity_cost_with_solar() -> None:
 
     device = _make_device(daily_runtime_min=15.0, peak_usage_w=1000.0)
 
-    results = compute_schedules([device], slots, solar_forecast, 500.0, now)
+    results, _ = compute_schedules([device], slots, solar_forecast, 500.0, now)
     # Solar at 10:00 is preferred: -0.24 < 0.02
     assert results["dev1"].should_be_on
     assert results["dev1"].reason == "Scheduled: solar surplus available"
@@ -603,7 +604,7 @@ def test_energy_price_no_solar_unaffected() -> None:
     device = _make_device(daily_runtime_min=15.0)
 
     # No solar forecast — energy_price has no effect, cheapest total wins
-    results = compute_schedules([device], slots, None, 0.0, now)
+    results, _ = compute_schedules([device], slots, None, 0.0, now)
     assert results["dev1"].should_be_on
     assert results["dev1"].scheduled_slots[0] == now
 
@@ -641,7 +642,7 @@ def test_forecast_bias_correction_scales_future_slots() -> None:
     )
 
     # Without bias: each slot has 1000W surplus, one device per slot
-    results_no_bias = compute_schedules(
+    results_no_bias, _ = compute_schedules(
         [dev_a, dev_b], slots, solar_forecast, 500.0, now
     )
     # A gets 10:00 solar, B gets 11:00 solar — both solar-powered
@@ -650,7 +651,7 @@ def test_forecast_bias_correction_scales_future_slots() -> None:
     # With live surplus of 2000W (2x bias): future slot should scale to 2000W
     # Now both devices could share the 10:00 slot since it has 2000W live,
     # OR device B gets the bias-corrected 11:00 slot (2000W > 1000W needed)
-    results_biased = compute_schedules(
+    results_biased, _ = compute_schedules(
         [dev_a, dev_b],
         slots,
         solar_forecast,
@@ -661,6 +662,90 @@ def test_forecast_bias_correction_scales_future_slots() -> None:
     # Both should be solar-powered
     assert results_biased["a"].reason == "Scheduled: solar surplus available"
     assert results_biased["b"].reason == "Scheduled: solar surplus available"
+
+
+# -----------------------------------------------------------------------
+# use_actual_power toggle
+# -----------------------------------------------------------------------
+
+
+def test_effective_usage_default_returns_peak() -> None:
+    """With use_actual_power=False (default), effective_usage_w returns peak."""
+    device = _make_device(peak_usage_w=1000.0)
+    device.is_on = True
+    device.actual_usage_w = 50.0
+    device.use_actual_power = False
+
+    assert device.effective_usage_w == 1000.0
+
+
+def test_effective_usage_enabled_returns_actual() -> None:
+    """With use_actual_power=True, effective_usage_w returns actual when on."""
+    device = _make_device(peak_usage_w=1000.0)
+    device.is_on = True
+    device.actual_usage_w = 50.0
+    device.use_actual_power = True
+
+    assert device.effective_usage_w == 50.0
+
+
+def test_effective_usage_enabled_zero_power() -> None:
+    """With use_actual_power=True, actual_usage_w=0 is valid (boiler idle)."""
+    device = _make_device(peak_usage_w=1000.0)
+    device.is_on = True
+    device.actual_usage_w = 0.0
+    device.use_actual_power = True
+
+    assert device.effective_usage_w == 0.0
+
+
+def test_effective_usage_enabled_but_off_returns_peak() -> None:
+    """With use_actual_power=True but device off, returns peak (planning)."""
+    device = _make_device(peak_usage_w=1000.0)
+    device.is_on = False
+    device.actual_usage_w = 50.0
+    device.use_actual_power = True
+
+    assert device.effective_usage_w == 1000.0
+
+
+def test_boiler_frees_solar_for_others() -> None:
+    """Boiler with use_actual_power=True drawing 0W frees solar for others.
+
+    Boiler (priority 1, peak 1500W) is ON but drawing 0W (water hot).
+    With use_actual_power=True, only 0W of solar is consumed,
+    leaving the full surplus for device B.
+    """
+    now = datetime(2026, 2, 9, 10, 0, 0, tzinfo=TZ)
+    slot_1015 = now + timedelta(minutes=15)
+
+    slots = [
+        PriceSlot(start_time=now, price=0.30, energy_price=0.24),
+        PriceSlot(start_time=slot_1015, price=0.25, energy_price=0.2),
+    ]
+
+    # Solar: 2500 Wh, consumption 500W -> surplus 2000W
+    solar_forecast = {now.isoformat(): 2500}
+
+    boiler = _make_device(
+        subentry_id="boiler", daily_runtime_min=15.0, priority=1, peak_usage_w=1500.0
+    )
+    boiler.is_on = True
+    boiler.actual_usage_w = 0.0
+    boiler.use_actual_power = True
+
+    other = _make_device(
+        subentry_id="other", daily_runtime_min=15.0, priority=2, peak_usage_w=1000.0
+    )
+
+    results, _ = compute_schedules([boiler, other], slots, solar_forecast, 500.0, now)
+
+    # Boiler is assigned to 10:00 (solar) but consumes 0W
+    assert results["boiler"].should_be_on
+    # Other device gets full solar since boiler used 0W
+    assert results["other"].should_be_on
+    assert results["other"].scheduled_slots[0] == now
+    assert results["other"].reason == "Scheduled: solar surplus available"
 
 
 def test_live_solar_peak_must_fit_fully() -> None:
@@ -681,7 +766,7 @@ def test_live_solar_peak_must_fit_fully() -> None:
     device = _make_device(daily_runtime_min=15.0, peak_usage_w=1000.0)
 
     # Live surplus 800W — doesn't cover 1000W peak
-    results = compute_schedules(
+    results, _ = compute_schedules(
         [device],
         slots,
         None,

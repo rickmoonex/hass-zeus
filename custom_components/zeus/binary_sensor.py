@@ -25,10 +25,10 @@ from .const import (
     CONF_POWER_SENSOR,
     CONF_PRIORITY,
     CONF_SWITCH_ENTITY,
-    CONF_TARGET_TEMPERATURE,
-    CONF_TEMPERATURE_MARGIN,
     CONF_TEMPERATURE_SENSOR,
+    CONF_TEMPERATURE_TOLERANCE,
     DOMAIN,
+    SUBENTRY_MANUAL_DEVICE,
     SUBENTRY_SWITCH_DEVICE,
     SUBENTRY_THERMOSTAT_DEVICE,
 )
@@ -69,6 +69,18 @@ async def async_setup_entry(
                 [
                     ZeusThermostatScheduleSensor(
                         coordinator, entry, subentry.subentry_id, hass
+                    )
+                ],
+                config_subentry_id=subentry.subentry_id,
+            )
+
+    # Per-manual-device binary sensors (linked to their subentry)
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type == SUBENTRY_MANUAL_DEVICE:
+            async_add_entities(
+                [
+                    ZeusManualDeviceReservedSensor(
+                        coordinator, entry, subentry.subentry_id
                     )
                 ],
                 config_subentry_id=subentry.subentry_id,
@@ -431,9 +443,17 @@ class ZeusThermostatScheduleSensor(
                 with contextlib.suppress(ValueError, TypeError):
                     current_usage_w = float(state.state)
 
-        target = float(data.get(CONF_TARGET_TEMPERATURE, 20.0))
-        margin = float(data.get(CONF_TEMPERATURE_MARGIN, 1.5))
         min_cycle = float(data.get(CONF_MIN_CYCLE_TIME, 5))
+
+        # Read target temperature and tolerance from climate entity / config
+        target_temp: float | None = None
+        tolerance = float(data.get(CONF_TEMPERATURE_TOLERANCE, 1.5))
+        climate_entity_id = self._find_climate_entity()
+        if climate_entity_id and self.hass is not None:
+            climate_state = self.hass.states.get(climate_entity_id)
+            if climate_state:
+                with contextlib.suppress(ValueError, TypeError):
+                    target_temp = float(climate_state.attributes.get("temperature", 0))
 
         attrs: dict[str, Any] = {
             "managed_entity": data.get(CONF_SWITCH_ENTITY),
@@ -442,10 +462,14 @@ class ZeusThermostatScheduleSensor(
             "peak_usage_w": data.get(CONF_PEAK_USAGE),
             "temperature_sensor": temp_sensor,
             "current_temperature": current_temp,
-            "target_temperature": target,
-            "temperature_margin": margin,
-            "lower_bound": target - margin,
-            "upper_bound": target + margin,
+            "target_temperature": target_temp,
+            "temperature_tolerance": tolerance,
+            "heating_lower_bound": round(target_temp - tolerance, 1)
+            if target_temp is not None
+            else None,
+            "heating_upper_bound": round(target_temp + tolerance, 1)
+            if target_temp is not None
+            else None,
             "priority": data.get(CONF_PRIORITY),
             "min_cycle_time_min": min_cycle,
             "cycle_locked": self._is_cycle_locked(desired_on=not self._attr_is_on)
@@ -458,6 +482,19 @@ class ZeusThermostatScheduleSensor(
             attrs["heating_reason"] = result.reason
 
         return attrs
+
+    def _find_climate_entity(self) -> str | None:
+        """Find the Zeus climate entity ID for this subentry."""
+        if self.hass is None:
+            return None
+        ent_reg = er.async_get(self.hass)
+        expected_unique_id = f"{self._entry.entry_id}_{self._subentry_id}_climate"
+        for ent_entry in ent_reg.entities.get_entries_for_config_entry_id(
+            self._entry.entry_id
+        ):
+            if ent_entry.unique_id == expected_unique_id:
+                return ent_entry.entity_id
+        return None
 
     def _get_min_cycle_time_min(self) -> float:
         """Get the minimum cycle time in minutes from config."""
@@ -536,3 +573,64 @@ class ZeusThermostatScheduleSensor(
             )
         except Exception:  # noqa: BLE001
             _LOGGER.warning("Failed to %s %s", service, entity_id, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Manual device binary sensors
+# ---------------------------------------------------------------------------
+
+
+class ZeusManualDeviceReservedSensor(
+    CoordinatorEntity[PriceCoordinator], BinarySensorEntity
+):
+    """Binary sensor reporting whether a manual device has a reserved time slot."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "manual_device_reserved"
+
+    def __init__(
+        self,
+        coordinator: PriceCoordinator,
+        entry: ConfigEntry,
+        subentry_id: str,
+    ) -> None:
+        """Initialize the manual device reserved binary sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._subentry_id = subentry_id
+        self._attr_unique_id = f"{entry.entry_id}_{subentry_id}_manual_reserved"
+
+        subentry = entry.subentries.get(subentry_id)
+        device_name = subentry.title if subentry else "Manual Device"
+        self._attr_translation_placeholders = {"device_name": device_name}
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{entry.entry_id}_{subentry_id}")},
+            name=device_name,
+            manufacturer="Zeus",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+        reservation = coordinator.get_reservation(subentry_id)
+        self._attr_is_on = reservation is not None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        reservation = self.coordinator.get_reservation(self._subentry_id)
+        self._attr_is_on = reservation is not None
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return reservation time attributes."""
+        reservation = self.coordinator.get_reservation(self._subentry_id)
+        if reservation:
+            return {
+                "reservation_start": reservation[0].isoformat(),
+                "reservation_end": reservation[1].isoformat(),
+            }
+        return {
+            "reservation_start": None,
+            "reservation_end": None,
+        }

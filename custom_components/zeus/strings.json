@@ -132,7 +132,8 @@
             "daily_runtime": "Required daily runtime",
             "deadline": "Deadline",
             "priority": "Priority",
-            "min_cycle_time": "Minimum cycle time"
+            "min_cycle_time": "Minimum cycle time",
+            "use_actual_power": "Use actual power for scheduling"
           },
           "data_description": {
             "switch_entity": "Switch or input_boolean entity that controls the device.",
@@ -141,7 +142,8 @@
             "daily_runtime": "How many minutes the device should run each day.",
             "deadline": "Time by which the daily runtime must be completed.",
             "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority devices are scheduled into cheaper slots first.",
-            "min_cycle_time": "Minimum time in minutes the device must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable."
+            "min_cycle_time": "Minimum time in minutes the device must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable.",
+            "use_actual_power": "When enabled, this device's real-time power reading is used to calculate available capacity for other devices. Enable for devices that may draw no power while on (e.g., a boiler with an internal thermostat). Disable for devices with fluctuating power (e.g., a washing machine) to prevent other devices from reacting to temporary power dips."
           }
         },
         "reconfigure": {
@@ -155,7 +157,8 @@
             "daily_runtime": "Required daily runtime",
             "deadline": "Deadline",
             "priority": "Priority",
-            "min_cycle_time": "Minimum cycle time"
+            "min_cycle_time": "Minimum cycle time",
+            "use_actual_power": "Use actual power for scheduling"
           },
           "data_description": {
             "switch_entity": "Switch or input_boolean entity that controls the device.",
@@ -164,7 +167,8 @@
             "daily_runtime": "How many minutes the device should run each day.",
             "deadline": "Time by which the daily runtime must be completed.",
             "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority devices are scheduled into cheaper slots first.",
-            "min_cycle_time": "Minimum time in minutes the device must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable."
+            "min_cycle_time": "Minimum time in minutes the device must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable.",
+            "use_actual_power": "When enabled, this device's real-time power reading is used to calculate available capacity for other devices. Enable for devices that may draw no power while on (e.g., a boiler with an internal thermostat). Disable for devices with fluctuating power (e.g., a washing machine) to prevent other devices from reacting to temporary power dips."
           }
         }
       },
@@ -181,15 +185,14 @@
       "step": {
         "user": {
           "title": "Add thermostat device",
-          "description": "Configure a heating zone managed by Zeus as a software thermostat. Zeus maintains the target temperature within the margin while optimizing energy cost.",
+          "description": "Configure a heating zone managed by Zeus as a software thermostat. After adding, set the desired temperature range on the climate entity.",
           "data": {
             "name": "Name",
             "switch_entity": "Switch entity",
             "power_sensor": "Power sensor",
             "temperature_sensor": "Temperature sensor",
             "peak_usage": "Peak power usage",
-            "target_temperature": "Target temperature",
-            "temperature_margin": "Temperature margin",
+            "temperature_tolerance": "Temperature tolerance",
             "priority": "Priority",
             "min_cycle_time": "Minimum cycle time"
           },
@@ -198,8 +201,7 @@
             "power_sensor": "Sensor entity that reports the current power consumption of the heater in watts.",
             "temperature_sensor": "Sensor entity that reports the current zone temperature in degrees Celsius.",
             "peak_usage": "Peak power consumption of the heater in watts.",
-            "target_temperature": "Desired temperature for this zone in degrees Celsius.",
-            "temperature_margin": "Allowed deviation from target temperature. Zeus keeps the temperature within target +/- margin.",
+            "temperature_tolerance": "Allowed deviation from target temperature. Zeus heats between target minus and target plus this value.",
             "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority zones get solar surplus first.",
             "min_cycle_time": "Minimum time in minutes the heater must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable."
           }
@@ -213,8 +215,7 @@
             "power_sensor": "Power sensor",
             "temperature_sensor": "Temperature sensor",
             "peak_usage": "Peak power usage",
-            "target_temperature": "Target temperature",
-            "temperature_margin": "Temperature margin",
+            "temperature_tolerance": "Temperature tolerance",
             "priority": "Priority",
             "min_cycle_time": "Minimum cycle time"
           },
@@ -223,8 +224,7 @@
             "power_sensor": "Sensor entity that reports the current power consumption of the heater in watts.",
             "temperature_sensor": "Sensor entity that reports the current zone temperature in degrees Celsius.",
             "peak_usage": "Peak power consumption of the heater in watts.",
-            "target_temperature": "Desired temperature for this zone in degrees Celsius.",
-            "temperature_margin": "Allowed deviation from target temperature. Zeus keeps the temperature within target +/- margin.",
+            "temperature_tolerance": "Allowed deviation from target temperature. Zeus heats between target minus and target plus this value.",
             "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority zones get solar surplus first.",
             "min_cycle_time": "Minimum time in minutes the heater must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable."
           }
@@ -232,6 +232,60 @@
       },
       "abort": {
         "reconfigure_successful": "Thermostat device reconfigured successfully"
+      }
+    },
+    "manual_device": {
+      "entry_type": "Manual Device",
+      "initiate_flow": {
+        "user": "Add manual device",
+        "reconfigure": "Reconfigure manual device"
+      },
+      "step": {
+        "user": {
+          "title": "Add manual device",
+          "description": "Configure a non-smart device (e.g., dishwasher, oven). Zeus will recommend the cheapest time to run it and let you reserve that slot.",
+           "data": {
+            "name": "Name",
+            "peak_usage": "Peak power usage",
+            "cycle_duration": "Cycle duration",
+            "dynamic_cycle_duration": "Dynamic cycle duration",
+            "power_sensor": "Power sensor",
+            "delay_intervals": "Delay intervals",
+            "priority": "Priority"
+          },
+          "data_description": {
+            "peak_usage": "Peak power consumption of the device in watts.",
+            "cycle_duration": "Default cycle duration in minutes (e.g., 90 for a dishwasher).",
+            "dynamic_cycle_duration": "Allow changing the cycle duration before each run. Enable for devices with variable program lengths (e.g., a dishwasher with different wash cycles).",
+            "power_sensor": "Optional: sensor entity that reports the current power consumption in watts.",
+            "delay_intervals": "Optional: comma-separated delay hours the device supports (e.g., '3,6,9'). When set, Zeus recommends the cheapest delay interval instead of an exact start time.",
+            "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority devices get solar surplus first when reserving."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure manual device",
+          "description": "Update the manual device configuration.",
+          "data": {
+            "name": "Name",
+            "peak_usage": "Peak power usage",
+            "cycle_duration": "Cycle duration",
+            "dynamic_cycle_duration": "Dynamic cycle duration",
+            "power_sensor": "Power sensor",
+            "delay_intervals": "Delay intervals",
+            "priority": "Priority"
+          },
+          "data_description": {
+            "peak_usage": "Peak power consumption of the device in watts.",
+            "cycle_duration": "Default cycle duration in minutes (e.g., 90 for a dishwasher).",
+            "dynamic_cycle_duration": "Allow changing the cycle duration before each run. Enable for devices with variable program lengths (e.g., a dishwasher with different wash cycles).",
+            "power_sensor": "Optional: sensor entity that reports the current power consumption in watts.",
+            "delay_intervals": "Optional: comma-separated delay hours the device supports (e.g., '3,6,9'). When set, Zeus recommends the cheapest delay interval instead of an exact start time.",
+            "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority devices get solar surplus first when reserving."
+          }
+        }
+      },
+      "abort": {
+        "reconfigure_successful": "Manual device reconfigured successfully"
       }
     }
   },
@@ -291,6 +345,9 @@
       },
       "thermostat_runtime_today": {
         "name": "{device_name} heating runtime today"
+      },
+      "manual_device_recommendation": {
+        "name": "{device_name} recommended start"
       }
     },
     "binary_sensor": {
@@ -302,6 +359,24 @@
       },
       "thermostat_schedule": {
         "name": "{device_name} heating"
+      },
+      "manual_device_reserved": {
+        "name": "{device_name} reserved"
+      }
+    },
+    "button": {
+      "manual_device_reserve": {
+        "name": "{device_name} reserve slot"
+      }
+    },
+    "number": {
+      "manual_device_cycle_duration": {
+        "name": "{device_name} cycle duration"
+      }
+    },
+    "climate": {
+      "thermostat": {
+        "name": "{device_name} thermostat"
       }
     },
     "switch": {

@@ -21,13 +21,18 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_CYCLE_DURATION,
+    CONF_DELAY_INTERVALS,
+    CONF_DYNAMIC_CYCLE_DURATION,
     CONF_ENERGY_USAGE_ENTITY,
     CONF_FORECAST_ENTITY,
     CONF_MAX_POWER_OUTPUT,
+    CONF_PEAK_USAGE,
     CONF_PRODUCTION_ENTITY,
     CONF_SWITCH_ENTITY,
     DOMAIN,
     SUBENTRY_HOME_MONITOR,
+    SUBENTRY_MANUAL_DEVICE,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
     SUBENTRY_THERMOSTAT_DEVICE,
@@ -109,6 +114,18 @@ async def async_setup_entry(
                 [
                     ZeusThermostatRuntimeTodaySensor(
                         coordinator, entry, subentry.subentry_id, hass
+                    ),
+                ],
+                config_subentry_id=subentry.subentry_id,
+            )
+
+    # Per-manual-device sensors (linked to their subentry)
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type == SUBENTRY_MANUAL_DEVICE:
+            async_add_entities(
+                [
+                    ZeusManualDeviceRecommendationSensor(
+                        coordinator, entry, subentry.subentry_id
                     ),
                 ],
                 config_subentry_id=subentry.subentry_id,
@@ -931,3 +948,173 @@ class ZeusThermostatRuntimeTodaySensor(
         # coordinator provides new schedule results. The actual runtime
         # tracking happens via the recorder in the scheduler module.
         self.async_write_ha_state()
+
+
+# ---------------------------------------------------------------------------
+# Manual device sensors
+# ---------------------------------------------------------------------------
+
+_MAX_RANKED_WINDOWS = 10
+
+
+class ZeusManualDeviceRecommendationSensor(
+    CoordinatorEntity[PriceCoordinator], SensorEntity
+):
+    """Sensor showing the recommended start time for a manual device cycle."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "manual_device_recommendation"
+
+    def __init__(
+        self,
+        coordinator: PriceCoordinator,
+        entry: ConfigEntry,
+        subentry_id: str,
+    ) -> None:
+        """Initialize the manual device recommendation sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._subentry_id = subentry_id
+        self._attr_unique_id = f"{entry.entry_id}_{subentry_id}_manual_recommendation"
+
+        subentry = entry.subentries.get(subentry_id)
+        device_name = subentry.title if subentry else "Manual Device"
+        self._attr_translation_placeholders = {"device_name": device_name}
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{entry.entry_id}_{subentry_id}")},
+            name=device_name,
+            manufacturer="Zeus",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        """Update sensor state from coordinator ranking results."""
+        ranking = self.coordinator.manual_device_results.get(self._subentry_id)
+        if ranking and ranking.recommended_start:
+            self._attr_native_value = ranking.recommended_start.strftime("%H:%M")
+        else:
+            self._attr_native_value = None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra state attributes with ranking details."""
+        ranking = self.coordinator.manual_device_results.get(self._subentry_id)
+        reservation = self.coordinator.get_reservation(self._subentry_id)
+
+        subentry = self._entry.subentries.get(self._subentry_id)
+        cycle_duration_min = (
+            float(subentry.data.get(CONF_CYCLE_DURATION, 0)) if subentry else 0.0
+        )
+        peak_usage_w = float(subentry.data.get(CONF_PEAK_USAGE, 0)) if subentry else 0.0
+
+        has_delay_intervals = bool(subentry and subentry.data.get(CONF_DELAY_INTERVALS))
+        dynamic_cycle = bool(
+            subentry and subentry.data.get(CONF_DYNAMIC_CYCLE_DURATION, False)
+        )
+
+        # Resolve the number entity_id for cycle duration (if dynamic)
+        number_entity_id: str | None = None
+        if dynamic_cycle and self.hass is not None:
+            ent_reg = er.async_get(self.hass)
+            number_uid = (
+                f"{self._entry.entry_id}_{self._subentry_id}_manual_cycle_duration"
+            )
+            number_entry = ent_reg.async_get_entity_id("number", DOMAIN, number_uid)
+            if number_entry:
+                number_entity_id = number_entry
+
+        attrs: dict[str, Any] = {
+            "subentry_id": self._subentry_id,
+            "cycle_duration_min": cycle_duration_min,
+            "peak_usage_w": peak_usage_w,
+            "dynamic_cycle_duration": dynamic_cycle,
+            "number_entity_id": number_entity_id,
+            "has_delay_intervals": has_delay_intervals,
+            "reserved": reservation is not None,
+            "reservation_start": reservation[0].isoformat() if reservation else None,
+            "reservation_end": reservation[1].isoformat() if reservation else None,
+        }
+
+        if ranking:
+            attrs["recommended_start"] = (
+                ranking.recommended_start.isoformat()
+                if ranking.recommended_start
+                else None
+            )
+            attrs["recommended_end"] = (
+                ranking.recommended_end.isoformat() if ranking.recommended_end else None
+            )
+
+            if ranking.windows:
+                best = ranking.windows[0]
+                attrs["estimated_cost"] = round(best.total_cost, 4)
+                attrs["delay_hours"] = best.delay_hours
+
+                # Compute cost_if_now: what it would cost to start right now
+                cost_now = self._compute_cost_if_now(ranking)
+                attrs["cost_if_now"] = (
+                    round(cost_now, 4) if cost_now is not None else None
+                )
+
+                if cost_now is not None and cost_now > 0:
+                    savings = ((cost_now - best.total_cost) / cost_now) * 100.0
+                    attrs["savings_pct"] = round(max(0.0, savings), 1)
+                else:
+                    attrs["savings_pct"] = None
+
+                # Top ranked windows
+                attrs["ranked_windows"] = [
+                    {
+                        "start": w.start_time.isoformat(),
+                        "end": w.end_time.isoformat(),
+                        "cost": round(w.total_cost, 4),
+                        "solar_pct": round(w.solar_fraction * 100.0, 1),
+                        **(
+                            {"delay_hours": w.delay_hours}
+                            if w.delay_hours is not None
+                            else {}
+                        ),
+                    }
+                    for w in ranking.windows[:_MAX_RANKED_WINDOWS]
+                ]
+            else:
+                attrs["estimated_cost"] = None
+                attrs["delay_hours"] = None
+                attrs["cost_if_now"] = None
+                attrs["savings_pct"] = None
+                attrs["ranked_windows"] = []
+        else:
+            attrs["recommended_start"] = None
+            attrs["recommended_end"] = None
+            attrs["estimated_cost"] = None
+            attrs["delay_hours"] = None
+            attrs["cost_if_now"] = None
+            attrs["savings_pct"] = None
+            attrs["ranked_windows"] = []
+
+        return attrs
+
+    def _compute_cost_if_now(self, ranking: Any) -> float | None:
+        """Find the window starting closest to now (first window chronologically)."""
+        if not ranking.windows:
+            return None
+        now = dt_util.now()
+        # Find the first window whose start is >= now (or the very first one)
+        for window in ranking.windows:
+            if window.start_time >= now:
+                # The earliest possible window — but this may not start *now*
+                pass
+        # The cost_if_now is the cost of the window starting at the current slot
+        # Find the window with the earliest start_time
+        earliest = min(ranking.windows, key=lambda w: w.start_time)
+        if earliest.start_time <= now + timedelta(minutes=15):
+            return earliest.total_cost
+        return None

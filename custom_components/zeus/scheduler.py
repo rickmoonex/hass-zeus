@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from homeassistant.helpers.entity_registry import EntityRegistry
 
 from homeassistant.components.recorder import history
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, State
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.recorder import get_instance
 from homeassistant.util import dt as dt_util
 
@@ -22,8 +27,10 @@ except ImportError:
     _get_forecast = None
 
 from .const import (
+    CONF_CYCLE_DURATION,
     CONF_DAILY_RUNTIME,
     CONF_DEADLINE,
+    CONF_DELAY_INTERVALS,
     CONF_ENERGY_USAGE_ENTITY,
     CONF_MIN_CYCLE_TIME,
     CONF_PEAK_USAGE,
@@ -31,20 +38,20 @@ from .const import (
     CONF_PRIORITY,
     CONF_PRODUCTION_ENTITY,
     CONF_SWITCH_ENTITY,
-    CONF_TARGET_TEMPERATURE,
-    CONF_TEMPERATURE_MARGIN,
     CONF_TEMPERATURE_SENSOR,
+    CONF_TEMPERATURE_TOLERANCE,
+    CONF_USE_ACTUAL_POWER,
+    SLOT_DURATION_MIN,
     SUBENTRY_HOME_MONITOR,
+    SUBENTRY_MANUAL_DEVICE,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
     SUBENTRY_THERMOSTAT_DEVICE,
 )
 from .coordinator import PriceCoordinator, PriceSlot
+from .thermal_model import async_get_learned_avg_power_w, blend_with_peak
 
 _LOGGER = logging.getLogger(__name__)
-
-# Slot duration in minutes (matches Tibber's 15-minute slots)
-SLOT_DURATION_MIN = 15
 
 # Minimum number of time parts when parsing a deadline string (HH:MM:SS)
 _TIME_PARTS_WITH_SECONDS = 3
@@ -66,19 +73,29 @@ class DeviceScheduleRequest:
     runtime_today_min: float = 0.0
     is_on: bool = False
     actual_usage_w: float | None = None
+    use_actual_power: bool = False
 
     @property
     def effective_usage_w(self) -> float:
         """
         Power draw used for solar consumption calculations.
 
-        When the device is currently ON and reporting a live reading,
-        use the actual draw (which may be much lower than peak, e.g.
-        a washing machine in rinse vs. heat phase).  For planning
-        future slots or when the device is off, use peak as a safe
-        upper bound.
+        When ``use_actual_power`` is enabled **and** the device is
+        currently ON with a live reading, use the actual draw.  This is
+        intended for devices whose real consumption may be zero while
+        technically "on" (e.g. a boiler whose water is already hot).
+
+        When ``use_actual_power`` is disabled (the default), peak is
+        always returned.  This prevents other devices from reacting to
+        temporary power dips in variable-load devices like washing
+        machines.
         """
-        if self.is_on and self.actual_usage_w is not None and self.actual_usage_w > 0:
+        if (
+            self.use_actual_power
+            and self.is_on
+            and self.actual_usage_w is not None
+            and self.actual_usage_w >= 0
+        ):
             return self.actual_usage_w
         return self.peak_usage_w
 
@@ -114,24 +131,35 @@ class ThermostatScheduleRequest:
     power_sensor: str
     temperature_sensor: str
     peak_usage_w: float
-    target_temperature: float
-    temperature_margin: float
+    target_temp_low: float
+    target_temp_high: float
     priority: int
     min_cycle_time_min: float = 5.0
+    hvac_mode: str = "heat"
+    # Learned data (populated from thermal model)
+    learned_avg_power_w: float | None = None
+    wh_per_degree: float | None = None
     # Live state (populated at runtime)
     current_temperature: float | None = None
     is_on: bool = False
     actual_usage_w: float | None = None
 
     @property
+    def effective_power_w(self) -> float:
+        """Best estimate of power draw, using learned data when available."""
+        if self.learned_avg_power_w is not None:
+            return self.learned_avg_power_w
+        return self.peak_usage_w
+
+    @property
     def lower_bound(self) -> float:
         """Temperature at which heating is forced on."""
-        return self.target_temperature - self.temperature_margin
+        return self.target_temp_low
 
     @property
     def upper_bound(self) -> float:
         """Temperature at which heating is forced off."""
-        return self.target_temperature + self.temperature_margin
+        return self.target_temp_high
 
     @property
     def temp_urgency(self) -> float:
@@ -309,35 +337,108 @@ def _build_device_requests(
                 deadline=deadline_time,
                 priority=int(data.get(CONF_PRIORITY, 5)),
                 min_cycle_time_min=float(data.get(CONF_MIN_CYCLE_TIME, 0)),
+                use_actual_power=bool(data.get(CONF_USE_ACTUAL_POWER, False)),
             )
         )
     return requests
 
 
-def _build_thermostat_requests(
+async def _async_build_thermostat_requests(
+    hass: HomeAssistant,
     entry: ConfigEntry,
+    coordinator: PriceCoordinator,
 ) -> list[ThermostatScheduleRequest]:
-    """Build thermostat schedule requests from thermostat device subentries."""
+    """
+    Build thermostat schedule requests from thermostat device subentries.
+
+    Reads the target temperature from the associated climate entity and
+    the tolerance from the subentry config to compute the heating bounds.
+    Populates learned power and thermal data from the coordinator's
+    thermal trackers and the recorder.
+    """
     requests = []
     for subentry in entry.subentries.values():
         if subentry.subentry_type != SUBENTRY_THERMOSTAT_DEVICE:
             continue
         data = subentry.data
+
+        tolerance = float(data.get(CONF_TEMPERATURE_TOLERANCE, 1.5))
+
+        # Look up the climate entity for this subentry to get the target temp
+        climate_entity_id = _find_climate_entity(hass, entry, subentry.subentry_id)
+        target_temp = 20.0  # default
+        hvac_mode = "heat"
+
+        if climate_entity_id:
+            climate_state = hass.states.get(climate_entity_id)
+            if climate_state:
+                hvac_mode = climate_state.state
+                attrs = climate_state.attributes
+                if "temperature" in attrs:
+                    with contextlib.suppress(ValueError, TypeError):
+                        target_temp = float(attrs["temperature"])
+
+        # Query learned average power from the recorder
+        peak_w = float(data[CONF_PEAK_USAGE])
+        switch_entity = data[CONF_SWITCH_ENTITY]
+        power_sensor = data[CONF_POWER_SENSOR]
+
+        learned_avg_power_w: float | None = None
+        wh_per_degree: float | None = None
+
+        try:
+            raw_learned, _on_hours = await async_get_learned_avg_power_w(
+                hass, power_sensor, switch_entity
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "Failed to get learned power for %s", subentry.title, exc_info=True
+            )
+            raw_learned = None
+
+        # Get thermal tracker data from coordinator
+        tracker = coordinator.get_thermal_tracker(subentry.subentry_id)
+        sample_count = tracker.sample_count if tracker else 0
+
+        if raw_learned is not None:
+            learned_avg_power_w = blend_with_peak(raw_learned, peak_w, sample_count)
+
+        if tracker and tracker.wh_per_degree is not None:
+            wh_per_degree = tracker.wh_per_degree
+
         requests.append(
             ThermostatScheduleRequest(
                 subentry_id=subentry.subentry_id,
                 name=subentry.title,
-                switch_entity=data[CONF_SWITCH_ENTITY],
-                power_sensor=data[CONF_POWER_SENSOR],
+                switch_entity=switch_entity,
+                power_sensor=power_sensor,
                 temperature_sensor=data[CONF_TEMPERATURE_SENSOR],
-                peak_usage_w=float(data[CONF_PEAK_USAGE]),
-                target_temperature=float(data[CONF_TARGET_TEMPERATURE]),
-                temperature_margin=float(data[CONF_TEMPERATURE_MARGIN]),
+                peak_usage_w=peak_w,
+                target_temp_low=target_temp - tolerance,
+                target_temp_high=target_temp + tolerance,
                 priority=int(data.get(CONF_PRIORITY, 5)),
                 min_cycle_time_min=float(data.get(CONF_MIN_CYCLE_TIME, 5)),
+                hvac_mode=hvac_mode,
+                learned_avg_power_w=learned_avg_power_w,
+                wh_per_degree=wh_per_degree,
             )
         )
     return requests
+
+
+def _find_climate_entity(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    subentry_id: str,
+) -> str | None:
+    """Find the Zeus climate entity ID for a thermostat subentry."""
+    ent_reg = er.async_get(hass)
+    expected_unique_id = f"{entry.entry_id}_{subentry_id}_climate"
+
+    for ent_entry in ent_reg.entities.get_entries_for_config_entry_id(entry.entry_id):
+        if ent_entry.unique_id == expected_unique_id:
+            return ent_entry.entity_id
+    return None
 
 
 @dataclass
@@ -704,7 +805,7 @@ def compute_schedules(  # noqa: PLR0913
     home_consumption_w: float,
     now: datetime,
     live_solar_surplus_w: float | None = None,
-) -> dict[str, ScheduleResult]:
+) -> tuple[dict[str, ScheduleResult], dict[datetime, _SlotInfo]]:
     """
     Compute the globally optimal schedule for all devices.
 
@@ -728,6 +829,13 @@ def compute_schedules(  # noqa: PLR0913
     the power sensor.  For the current slot, this actual draw is used
     for solar consumption calculations instead of peak, freeing surplus
     for other devices.
+
+    Returns:
+        A tuple of (schedule results dict, slot_info dict).  The slot_info
+        has its ``remaining_solar_w`` depleted by the assigned devices and
+        can be passed to ``compute_thermostat_decisions`` so both device
+        types share a single solar pool.
+
     """
     slot_info = _build_slot_info(
         price_slots, solar_forecast, home_consumption_w, now, live_solar_surplus_w
@@ -753,7 +861,7 @@ def compute_schedules(  # noqa: PLR0913
         )
 
     if not active_devices:
-        return results
+        return results, slot_info
 
     # Sort by priority for deterministic processing (1 = highest)
     active_devices.sort(key=lambda d: d.priority)
@@ -766,7 +874,7 @@ def compute_schedules(  # noqa: PLR0913
             device, states[device.subentry_id], slot_info, current_slot_start
         )
 
-    return results
+    return results, slot_info
 
 
 def _determine_reason(
@@ -794,51 +902,107 @@ def _get_current_slot_start(now: datetime) -> datetime:
     return now.replace(minute=minute, second=0, microsecond=0)
 
 
+async def _async_populate_switch_devices(
+    hass: HomeAssistant,
+    devices: list[DeviceScheduleRequest],
+) -> None:
+    """Populate live state for switch device requests."""
+    for device in devices:
+        device.runtime_today_min = await async_get_runtime_today_minutes(
+            hass, device.switch_entity
+        )
+        switch_state = hass.states.get(device.switch_entity)
+        device.is_on = switch_state is not None and switch_state.state == "on"
+        power_state = hass.states.get(device.power_sensor)
+        if power_state and power_state.state not in ("unknown", "unavailable"):
+            try:
+                device.actual_usage_w = float(power_state.state)
+            except (ValueError, TypeError):
+                device.actual_usage_w = None
+
+
+def _populate_thermostat_live_state(
+    hass: HomeAssistant,
+    thermostats: list[ThermostatScheduleRequest],
+) -> None:
+    """Populate live sensor readings for thermostat requests."""
+    for therm in thermostats:
+        temp_state = hass.states.get(therm.temperature_sensor)
+        if temp_state and temp_state.state not in ("unknown", "unavailable"):
+            try:
+                therm.current_temperature = float(temp_state.state)
+            except (ValueError, TypeError):
+                therm.current_temperature = None
+
+        switch_state = hass.states.get(therm.switch_entity)
+        therm.is_on = switch_state is not None and switch_state.state == "on"
+        power_state = hass.states.get(therm.power_sensor)
+        if power_state and power_state.state not in ("unknown", "unavailable"):
+            try:
+                therm.actual_usage_w = float(power_state.state)
+            except (ValueError, TypeError):
+                therm.actual_usage_w = None
+
+
+def _ensure_slot_info(  # noqa: PLR0913
+    shared_slot_info: dict[datetime, _SlotInfo] | None,
+    price_slots: list[PriceSlot],
+    solar_forecast: dict[str, Any] | None,
+    home_consumption_w: float,
+    now: datetime,
+    live_solar_surplus_w: float | None,
+) -> dict[datetime, _SlotInfo]:
+    """Return existing slot info or build it fresh."""
+    if shared_slot_info is not None:
+        return shared_slot_info
+    return _build_slot_info(
+        price_slots, solar_forecast, home_consumption_w, now, live_solar_surplus_w
+    )
+
+
 async def async_run_scheduler(
     hass: HomeAssistant,
     entry: ConfigEntry,
     coordinator: PriceCoordinator,
 ) -> dict[str, ScheduleResult]:
-    """Run the full scheduling cycle for switch and thermostat devices."""
+    """Run the full scheduling cycle for switch, thermostat, and manual devices."""
     results: dict[str, ScheduleResult] = {}
 
-    # Get shared data: price slots, solar forecast, home consumption, live surplus
     price_slots = _get_all_future_slots(coordinator)
     solar_forecast = await async_get_solar_forecast(hass)
-    _LOGGER.debug(
-        "Scheduler: solar_forecast=%s",
-        f"present ({len(solar_forecast)} entries)" if solar_forecast else "None",
-    )
-
     home_consumption_w = _get_home_consumption(hass, entry)
-    _LOGGER.debug("Scheduler: home_consumption_w=%.1f", home_consumption_w)
-
     live_solar_surplus_w = _get_live_solar_surplus(hass, entry, home_consumption_w)
-    _LOGGER.debug(
-        "Scheduler: live_solar_surplus_w=%s",
-        f"{live_solar_surplus_w:.0f}" if live_solar_surplus_w is not None else "None",
-    )
-
     now = dt_util.now()
+
+    # Build shared slot info once — all device types deplete the same solar pool.
+    shared_slot_info: dict[datetime, _SlotInfo] | None = None
+
+    # --- Manual device reservations (apply BEFORE smart device scheduling) ---
+    manual_requests = _build_manual_device_requests(hass, entry)
+    active_reservations = coordinator.get_active_reservations()
+    if active_reservations and manual_requests:
+        shared_slot_info = _ensure_slot_info(
+            shared_slot_info,
+            price_slots,
+            solar_forecast,
+            home_consumption_w,
+            now,
+            live_solar_surplus_w,
+        )
+        apply_reservations_to_slot_info(
+            shared_slot_info, active_reservations, manual_requests
+        )
 
     # --- Switch devices ---
     devices = _build_device_requests(entry)
     if devices:
-        for device in devices:
-            device.runtime_today_min = await async_get_runtime_today_minutes(
-                hass, device.switch_entity
+        await _async_populate_switch_devices(hass, devices)
+        if shared_slot_info is not None:
+            switch_results, shared_slot_info = _compute_schedules_with_slot_info(
+                devices, shared_slot_info, now
             )
-            switch_state = hass.states.get(device.switch_entity)
-            device.is_on = switch_state is not None and switch_state.state == "on"
-            power_state = hass.states.get(device.power_sensor)
-            if power_state and power_state.state not in ("unknown", "unavailable"):
-                try:
-                    device.actual_usage_w = float(power_state.state)
-                except (ValueError, TypeError):
-                    device.actual_usage_w = None
-
-        results.update(
-            compute_schedules(
+        else:
+            switch_results, shared_slot_info = compute_schedules(
                 devices,
                 price_slots,
                 solar_forecast,
@@ -846,30 +1010,12 @@ async def async_run_scheduler(
                 now,
                 live_solar_surplus_w=live_solar_surplus_w,
             )
-        )
+        results.update(switch_results)
 
     # --- Thermostat devices ---
-    thermostats = _build_thermostat_requests(entry)
+    thermostats = await _async_build_thermostat_requests(hass, entry, coordinator)
     if thermostats:
-        for therm in thermostats:
-            # Read live temperature
-            temp_state = hass.states.get(therm.temperature_sensor)
-            if temp_state and temp_state.state not in ("unknown", "unavailable"):
-                try:
-                    therm.current_temperature = float(temp_state.state)
-                except (ValueError, TypeError):
-                    therm.current_temperature = None
-
-            # Read live switch state and power draw
-            switch_state = hass.states.get(therm.switch_entity)
-            therm.is_on = switch_state is not None and switch_state.state == "on"
-            power_state = hass.states.get(therm.power_sensor)
-            if power_state and power_state.state not in ("unknown", "unavailable"):
-                try:
-                    therm.actual_usage_w = float(power_state.state)
-                except (ValueError, TypeError):
-                    therm.actual_usage_w = None
-
+        _populate_thermostat_live_state(hass, thermostats)
         results.update(
             compute_thermostat_decisions(
                 thermostats,
@@ -878,10 +1024,75 @@ async def async_run_scheduler(
                 home_consumption_w,
                 now,
                 live_solar_surplus_w=live_solar_surplus_w,
+                slot_info=shared_slot_info,
             )
         )
 
+    # --- Manual device rankings (compute AFTER smart device scheduling) ---
+    if manual_requests:
+        shared_slot_info = _ensure_slot_info(
+            shared_slot_info,
+            price_slots,
+            solar_forecast,
+            home_consumption_w,
+            now,
+            live_solar_surplus_w,
+        )
+        manual_results: dict[str, ManualDeviceRanking] = {}
+        for req in manual_requests:
+            manual_results[req.subentry_id] = compute_manual_device_rankings(
+                req, shared_slot_info, now
+            )
+        coordinator.manual_device_results = manual_results
+
     return results
+
+
+def _compute_schedules_with_slot_info(
+    devices: list[DeviceScheduleRequest],
+    slot_info: dict[datetime, _SlotInfo],
+    now: datetime,
+) -> tuple[dict[str, ScheduleResult], dict[datetime, _SlotInfo]]:
+    """
+    Run the switch scheduling algorithm on pre-built slot info.
+
+    Used when slot_info was already created (e.g. to apply manual device
+    reservations) so we don't rebuild and lose the reservation deductions.
+    """
+    current_slot_start = _get_current_slot_start(now)
+
+    results: dict[str, ScheduleResult] = {}
+    states: dict[str, _DeviceState] = {}
+    active_devices: list[DeviceScheduleRequest] = []
+
+    for device in devices:
+        if device.remaining_runtime_min <= 0:
+            results[device.subentry_id] = ScheduleResult(
+                subentry_id=device.subentry_id,
+                should_be_on=False,
+                remaining_runtime_min=0.0,
+                reason="Daily runtime already met",
+            )
+            continue
+        active_devices.append(device)
+        states[device.subentry_id] = _DeviceState(
+            remaining_needed=device.remaining_slots_needed,
+        )
+
+    if not active_devices:
+        return results, slot_info
+
+    active_devices.sort(key=lambda d: d.priority)
+
+    _apply_deadline_forced(active_devices, states, slot_info, now, current_slot_start)
+    _apply_cost_optimal(active_devices, states, slot_info, now, current_slot_start)
+
+    for device in active_devices:
+        results[device.subentry_id] = _build_result(
+            device, states[device.subentry_id], slot_info, current_slot_start
+        )
+
+    return results, slot_info
 
 
 def _get_all_future_slots(coordinator: PriceCoordinator) -> list[PriceSlot]:
@@ -977,6 +1188,7 @@ def compute_thermostat_decisions(  # noqa: PLR0913
     home_consumption_w: float,
     now: datetime,
     live_solar_surplus_w: float | None = None,
+    slot_info: dict[datetime, _SlotInfo] | None = None,
 ) -> dict[str, ScheduleResult]:
     """
     Compute heating decisions for all thermostat devices.
@@ -992,14 +1204,19 @@ def compute_thermostat_decisions(  # noqa: PLR0913
 
     Devices are processed by priority (1 = highest) so that higher-priority
     zones consume solar surplus first, leaving less for lower-priority zones.
+
+    When ``slot_info`` is provided (e.g. pre-depleted by switch device
+    scheduling), it is reused so that thermostats see the remaining solar
+    after switch devices have consumed their share.
     """
     if not thermostats:
         return {}
 
-    # Build slot info for solar awareness (reuse existing infrastructure)
-    slot_info = _build_slot_info(
-        price_slots, solar_forecast, home_consumption_w, now, live_solar_surplus_w
-    )
+    # Reuse shared slot_info if provided, otherwise build fresh
+    if slot_info is None:
+        slot_info = _build_slot_info(
+            price_slots, solar_forecast, home_consumption_w, now, live_solar_surplus_w
+        )
     current_slot_start = _get_current_slot_start(now)
 
     # Get current and upcoming price slots for comparison
@@ -1030,7 +1247,7 @@ def compute_thermostat_decisions(  # noqa: PLR0913
         # Consume solar surplus if this thermostat will heat
         if result.should_be_on and current_slot_start in slot_info:
             info = slot_info[current_slot_start]
-            consumption = thermostat.actual_usage_w or thermostat.peak_usage_w
+            consumption = thermostat.actual_usage_w or thermostat.effective_power_w
             info.remaining_solar_w = max(0.0, info.remaining_solar_w - consumption)
 
     return results
@@ -1052,6 +1269,16 @@ def _decide_thermostat(  # noqa: PLR0913
     temp = thermostat.current_temperature
     lower = thermostat.lower_bound
     upper = thermostat.upper_bound
+
+    # HVAC mode OFF — do not heat
+    if thermostat.hvac_mode == "off":
+        return ScheduleResult(
+            subentry_id=thermostat.subentry_id,
+            should_be_on=False,
+            remaining_runtime_min=0.0,
+            scheduled_slots=[],
+            reason="Thermostat off",
+        )
 
     # No temperature reading — safe fallback based on current state
     if temp is None:
@@ -1105,7 +1332,7 @@ def _decide_thermostat_optimized(  # noqa: PLR0913
     current_slot: _SlotInfo | None,
     upcoming_prices: list[float],
     upcoming_slots: list[_SlotInfo],
-    slot_info: dict[datetime, _SlotInfo],  # noqa: ARG001
+    slot_info: dict[datetime, _SlotInfo],
     current_slot_start: datetime,
 ) -> ScheduleResult:
     """
@@ -1115,13 +1342,18 @@ def _decide_thermostat_optimized(  # noqa: PLR0913
     the more willing Zeus is to accept higher-priced slots for heating.
     Solar surplus is always used (free energy). Solar forecast is considered
     for look-ahead: coast if free solar is expected soon.
+
+    When thermal model data is available (``wh_per_degree``), thermal
+    headroom is estimated to decide whether the zone can safely coast
+    until a cheaper slot arrives.
     """
     urgency = thermostat.temp_urgency
+    power_w = thermostat.effective_power_w
 
     # Check solar surplus availability in current slot
     has_solar = False
     if current_slot is not None:
-        has_solar = current_slot.remaining_solar_w >= thermostat.peak_usage_w
+        has_solar = current_slot.remaining_solar_w >= power_w
 
     # Solar surplus available — always heat (free energy)
     if has_solar:
@@ -1135,7 +1367,7 @@ def _decide_thermostat_optimized(  # noqa: PLR0913
 
     # Solar forecast look-ahead: if urgency is low and solar is coming soon, coast
     if urgency < _SOLAR_WAIT_URGENCY_THRESHOLD and _solar_coming_soon(
-        upcoming_slots, thermostat.peak_usage_w
+        upcoming_slots, power_w
     ):
         return ScheduleResult(
             subentry_id=thermostat.subentry_id,
@@ -1144,6 +1376,13 @@ def _decide_thermostat_optimized(  # noqa: PLR0913
             scheduled_slots=[],
             reason="Coasting: solar surplus expected soon",
         )
+
+    # Thermal headroom: if we know Wh/°C, estimate how long until lower bound
+    headroom_result = _check_thermal_headroom(
+        thermostat, upcoming_prices, upcoming_slots, slot_info, current_slot_start
+    )
+    if headroom_result is not None:
+        return headroom_result
 
     # Price-based decision: urgency-weighted threshold
     if current_slot is not None and upcoming_prices:
@@ -1189,6 +1428,80 @@ def _decide_thermostat_optimized(  # noqa: PLR0913
     )
 
 
+# Thermal headroom thresholds
+_HEADROOM_COAST_HOURS = 2.0  # Coast if we can go this long before lower bound
+_HEADROOM_URGENT_HOURS = 0.5  # Boost urgency if time to lower bound is this short
+
+
+def _check_thermal_headroom(
+    thermostat: ThermostatScheduleRequest,
+    upcoming_prices: list[float],
+    upcoming_slots: list[_SlotInfo],
+    slot_info: dict[datetime, _SlotInfo],
+    current_slot_start: datetime,
+) -> ScheduleResult | None:
+    """
+    Use thermal model to decide whether to coast or heat urgently.
+
+    Returns a ScheduleResult if the thermal model provides a clear signal,
+    or None to fall through to the normal price-based decision.
+    """
+    if thermostat.wh_per_degree is None or thermostat.current_temperature is None:
+        return None
+
+    power_w = thermostat.effective_power_w
+    if power_w <= 0:
+        return None
+
+    degrees_above_lower = thermostat.current_temperature - thermostat.lower_bound
+    if degrees_above_lower <= 0:
+        return None  # At or below lower — force on handles this
+
+    # Estimate coast time: how many hours until we hit the lower bound
+    # assuming the zone loses heat at the same rate it took to gain it
+    coast_time_hours = degrees_above_lower * thermostat.wh_per_degree / power_w
+
+    # Plenty of headroom and a cheaper slot exists within the coast window
+    if coast_time_hours > _HEADROOM_COAST_HOURS and upcoming_prices:
+        coast_slots = int(coast_time_hours * 60 / SLOT_DURATION_MIN)
+        reachable = upcoming_slots[:coast_slots]
+        current_price = (
+            slot_info[current_slot_start].price
+            if current_slot_start in slot_info
+            else None
+        )
+        if current_price is not None and any(
+            s.price < current_price for s in reachable
+        ):
+            return ScheduleResult(
+                subentry_id=thermostat.subentry_id,
+                should_be_on=False,
+                remaining_runtime_min=0.0,
+                scheduled_slots=[],
+                reason=(
+                    f"Coasting: thermal headroom {coast_time_hours:.1f}h,"
+                    f" cheaper slot available"
+                ),
+            )
+
+    # Very little headroom — boost effective urgency to accept current slot
+    if coast_time_hours < _HEADROOM_URGENT_HOURS:
+        current_slot = slot_info.get(current_slot_start)
+        if current_slot is not None:
+            return ScheduleResult(
+                subentry_id=thermostat.subentry_id,
+                should_be_on=True,
+                remaining_runtime_min=0.0,
+                scheduled_slots=[current_slot_start],
+                reason=(
+                    f"Heating: low thermal headroom"
+                    f" ({coast_time_hours:.1f}h to lower bound)"
+                ),
+            )
+
+    return None
+
+
 def _solar_coming_soon(
     upcoming_slots: list[_SlotInfo],
     device_peak_w: float,
@@ -1199,3 +1512,313 @@ def _solar_coming_soon(
         if slot.remaining_solar_w >= device_peak_w:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Manual (dumb) device ranking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ManualDeviceScheduleRequest:
+    """A non-smart device requesting schedule advice."""
+
+    subentry_id: str
+    name: str
+    peak_usage_w: float
+    cycle_duration_min: float
+    priority: int
+    power_sensor: str | None = None
+    delay_intervals_h: list[float] | None = None  # e.g. [3, 6, 9]
+
+
+@dataclass
+class ManualDeviceWindow:
+    """A single candidate time window for a manual device cycle."""
+
+    start_time: datetime
+    end_time: datetime
+    total_cost: float
+    solar_fraction: float  # 0.0-1.0, fraction of slots with solar coverage
+    delay_hours: float | None = None  # set when device uses delay intervals
+
+
+@dataclass
+class ManualDeviceRanking:
+    """Ranked windows for a manual device, cheapest first."""
+
+    subentry_id: str
+    windows: list[ManualDeviceWindow]  # sorted cheapest first
+    recommended_start: datetime | None
+    recommended_end: datetime | None
+
+
+def compute_manual_device_rankings(
+    request: ManualDeviceScheduleRequest,
+    slot_info: dict[datetime, _SlotInfo],
+    now: datetime,
+) -> ManualDeviceRanking:
+    """
+    Rank all contiguous time windows for a manual device cycle.
+
+    For devices with delay intervals, only windows starting at valid delay
+    offsets from ``now`` are considered. Otherwise, every contiguous block
+    of ``ceil(cycle_duration / 15)`` future slots is evaluated.
+    """
+    slots_needed = math.ceil(request.cycle_duration_min / SLOT_DURATION_MIN)
+    if slots_needed <= 0:
+        return _empty_ranking(request.subentry_id)
+
+    # Use all available future slots (scoped by however far the price data extends)
+    eligible = sorted(
+        st for st in slot_info if st + timedelta(minutes=SLOT_DURATION_MIN) > now
+    )
+    if not eligible:
+        return _empty_ranking(request.subentry_id)
+
+    if request.delay_intervals_h:
+        windows = _rank_delay_interval_windows(
+            request, slot_info, eligible, slots_needed, now
+        )
+    else:
+        windows = _rank_all_contiguous_windows(
+            request, slot_info, eligible, slots_needed
+        )
+
+    # Sort by total cost (cheapest first), then by solar fraction (higher first)
+    windows.sort(key=lambda w: (w.total_cost, -w.solar_fraction))
+
+    recommended_start = windows[0].start_time if windows else None
+    recommended_end = windows[0].end_time if windows else None
+
+    return ManualDeviceRanking(
+        subentry_id=request.subentry_id,
+        windows=windows,
+        recommended_start=recommended_start,
+        recommended_end=recommended_end,
+    )
+
+
+def _empty_ranking(subentry_id: str) -> ManualDeviceRanking:
+    """Return an empty ranking result."""
+    return ManualDeviceRanking(
+        subentry_id=subentry_id,
+        windows=[],
+        recommended_start=None,
+        recommended_end=None,
+    )
+
+
+def _rank_all_contiguous_windows(
+    request: ManualDeviceScheduleRequest,
+    slot_info: dict[datetime, _SlotInfo],
+    eligible: list[datetime],
+    slots_needed: int,
+) -> list[ManualDeviceWindow]:
+    """Find and score all contiguous windows of the required length."""
+    windows: list[ManualDeviceWindow] = []
+
+    for i in range(len(eligible) - slots_needed + 1):
+        window_slots = eligible[i : i + slots_needed]
+
+        if not _is_contiguous(window_slots):
+            continue
+
+        total_cost, solar_fraction = _score_window(
+            window_slots, slot_info, request.peak_usage_w
+        )
+        end_time = window_slots[-1] + timedelta(minutes=SLOT_DURATION_MIN)
+
+        windows.append(
+            ManualDeviceWindow(
+                start_time=window_slots[0],
+                end_time=end_time,
+                total_cost=total_cost,
+                solar_fraction=solar_fraction,
+            )
+        )
+
+    return windows
+
+
+def _rank_delay_interval_windows(
+    request: ManualDeviceScheduleRequest,
+    slot_info: dict[datetime, _SlotInfo],
+    eligible: list[datetime],
+    slots_needed: int,
+    now: datetime,
+) -> list[ManualDeviceWindow]:
+    """
+    Evaluate only windows starting at valid delay offsets from now.
+
+    For a device with delay_intervals_h=[3, 6, 9], we compute the slot
+    boundary for each delay and score that window.
+    """
+    windows: list[ManualDeviceWindow] = []
+    eligible_set = set(eligible)
+    last_eligible = eligible[-1] if eligible else now
+
+    for delay_h in sorted(request.delay_intervals_h or []):
+        target_start = now + timedelta(hours=delay_h)
+        # Snap to slot boundary
+        snapped = target_start.replace(
+            minute=(target_start.minute // SLOT_DURATION_MIN) * SLOT_DURATION_MIN,
+            second=0,
+            microsecond=0,
+        )
+        # Verify all required slots exist in the price data
+        window_slots = [
+            snapped + timedelta(minutes=SLOT_DURATION_MIN * k)
+            for k in range(slots_needed)
+        ]
+        if window_slots[-1] > last_eligible:
+            continue  # Not enough price data for this delay
+        if not all(st in eligible_set for st in window_slots):
+            continue
+
+        total_cost, solar_fraction = _score_window(
+            window_slots, slot_info, request.peak_usage_w
+        )
+        end_time = window_slots[-1] + timedelta(minutes=SLOT_DURATION_MIN)
+
+        windows.append(
+            ManualDeviceWindow(
+                start_time=snapped,
+                end_time=end_time,
+                total_cost=total_cost,
+                solar_fraction=solar_fraction,
+                delay_hours=delay_h,
+            )
+        )
+
+    return windows
+
+
+def _is_contiguous(slots: list[datetime]) -> bool:
+    """Check that slot start times form a contiguous sequence."""
+    for j in range(1, len(slots)):
+        if slots[j] - slots[j - 1] != timedelta(minutes=SLOT_DURATION_MIN):
+            return False
+    return True
+
+
+def _score_window(
+    window_slots: list[datetime],
+    slot_info: dict[datetime, _SlotInfo],
+    peak_usage_w: float,
+) -> tuple[float, float]:
+    """Score a window — returns (total_cost, solar_fraction)."""
+    total_cost = 0.0
+    solar_count = 0
+    for st in window_slots:
+        slot = slot_info[st]
+        total_cost += _cost_for_device_in_slot(slot, peak_usage_w)
+        if slot.remaining_solar_w >= peak_usage_w:
+            solar_count += 1
+    solar_fraction = solar_count / len(window_slots) if window_slots else 0.0
+    return total_cost, solar_fraction
+
+
+def _build_manual_device_requests(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> list[ManualDeviceScheduleRequest]:
+    """Build manual device schedule requests from subentries."""
+    ent_reg = er.async_get(hass)
+    requests = []
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != SUBENTRY_MANUAL_DEVICE:
+            continue
+        data = subentry.data
+
+        # Read cycle duration from the number entity if available,
+        # otherwise fall back to the config default.
+        config_duration = float(data[CONF_CYCLE_DURATION])
+        cycle_duration = _read_number_entity_value(
+            hass,
+            ent_reg,
+            entry.entry_id,
+            subentry.subentry_id,
+            config_duration,
+        )
+
+        # Parse delay intervals (e.g. "3,6,9" -> [3.0, 6.0, 9.0])
+        delay_intervals_h: list[float] | None = None
+        raw_intervals = data.get(CONF_DELAY_INTERVALS)
+        if raw_intervals:
+            delay_intervals_h = _parse_delay_intervals(str(raw_intervals))
+
+        requests.append(
+            ManualDeviceScheduleRequest(
+                subentry_id=subentry.subentry_id,
+                name=subentry.title,
+                peak_usage_w=float(data[CONF_PEAK_USAGE]),
+                cycle_duration_min=cycle_duration,
+                priority=int(data.get(CONF_PRIORITY, 5)),
+                power_sensor=data.get(CONF_POWER_SENSOR),
+                delay_intervals_h=delay_intervals_h,
+            )
+        )
+    return requests
+
+
+def _read_number_entity_value(
+    hass: HomeAssistant,
+    ent_reg: EntityRegistry,
+    entry_id: str,
+    subentry_id: str,
+    default: float,
+) -> float:
+    """Read the cycle duration number entity value, falling back to default."""
+    expected_uid = f"{entry_id}_{subentry_id}_manual_cycle_duration"
+    for ent_entry in ent_reg.entities.get_entries_for_config_entry_id(entry_id):
+        if ent_entry.unique_id == expected_uid:
+            state = hass.states.get(ent_entry.entity_id)
+            if state and state.state not in ("unknown", "unavailable"):
+                try:
+                    return float(state.state)
+                except (ValueError, TypeError):
+                    pass
+            break
+    return default
+
+
+def _parse_delay_intervals(raw: str) -> list[float] | None:
+    """Parse comma-separated delay hours string into a sorted list."""
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return None
+    intervals: list[float] = []
+    for p in parts:
+        try:
+            val = float(p)
+            if val > 0:
+                intervals.append(val)
+        except ValueError:
+            continue
+    return sorted(intervals) if intervals else None
+
+
+def apply_reservations_to_slot_info(
+    slot_info: dict[datetime, _SlotInfo],
+    reservations: dict[str, tuple[datetime, datetime]],
+    manual_requests: list[ManualDeviceScheduleRequest],
+) -> None:
+    """
+    Deduct reserved manual device power from the shared solar pool.
+
+    For each active reservation, finds the corresponding request's
+    peak_usage_w and deducts it from ``remaining_solar_w`` for all
+    slots within the reservation window.
+    """
+    request_by_id = {r.subentry_id: r for r in manual_requests}
+    for subentry_id, (start, end) in reservations.items():
+        req = request_by_id.get(subentry_id)
+        if req is None:
+            continue
+        for st, slot in slot_info.items():
+            slot_end = st + timedelta(minutes=SLOT_DURATION_MIN)
+            if st >= start and slot_end <= end:
+                slot.remaining_solar_w = max(
+                    0.0, slot.remaining_solar_w - req.peak_usage_w
+                )
