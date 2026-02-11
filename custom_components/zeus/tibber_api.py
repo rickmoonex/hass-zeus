@@ -131,7 +131,7 @@ class TibberApiClient:
             async with self._session.post(
                 TIBBER_API_ENDPOINT,
                 headers=headers,
-                data=payload,
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 401:  # noqa: PLR2004
