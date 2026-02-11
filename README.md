@@ -7,6 +7,7 @@ A Home Assistant custom integration for managing dynamic energy bills. Zeus fetc
 - **Dynamic energy pricing** -- fetches 15-minute price slots from Tibber
 - **Solar inverter output control** -- reduces inverter output during negative prices to avoid paying for grid export
 - **Device scheduling** -- automatically turns devices on/off at optimal times based on price, solar forecast, and real-time solar production
+- **Thermostat control** -- software thermostat for heating zones with temperature-aware, price/solar-optimized scheduling
 - **Real-time solar surplus** -- opportunistically activates devices when live solar exceeds the forecast
 - **Global cost optimization** -- minimizes total energy cost across all devices, with shared solar surplus and concurrent slot usage
 - **Minimum cycle time protection** -- prevents rapid toggling that could damage devices like compressors or washing machines
@@ -52,7 +53,6 @@ From the Zeus integration page, click **Add solar inverter**.
 | **Output control entity** | Number entity (0-100%) controlling inverter output |
 | **Maximum power output** | Max inverter power in watts |
 | **Solar forecast entity** | (Optional) Power sensor from forecast.solar, e.g., `sensor.power_production_now` |
-| **Feed-in rate** | (Optional) EUR/kWh earned for exporting solar to the grid. Used for opportunity cost calculations in the scheduler. |
 
 The inverter subentry enables the **Recommended inverter output** sensor and provides live solar data to the scheduler.
 
@@ -81,6 +81,22 @@ Click **Add switch device** for each device you want Zeus to manage.
 | **Deadline** | Time by which the daily runtime must be completed |
 | **Priority** | 1 (highest) to 10 (lowest) -- higher priority devices get cheaper slots first |
 | **Minimum cycle time** | (Optional) Minimum minutes the device must stay on or off before switching. Protects against rapid toggling. Set to 0 to disable. |
+
+### 5. Add thermostat devices (unlimited)
+
+Click **Add thermostat device** for each heating zone you want Zeus to manage as a software thermostat.
+
+| Field | Description |
+|---|---|
+| **Name** | Display name (e.g., "Bedroom 1 Radiator") |
+| **Switch entity** | The `switch.*` or `input_boolean.*` entity controlling the heater (e.g., a smart plug) |
+| **Power sensor** | Sensor reporting the heater's current power consumption in watts |
+| **Temperature sensor** | Sensor reporting the zone temperature in degrees Celsius |
+| **Peak power usage** | Maximum power the heater draws in watts |
+| **Target temperature** | Desired temperature for the zone (5-30 C) |
+| **Temperature margin** | Allowed deviation from target (0.5-5.0 C). Zeus keeps temp within target +/- margin |
+| **Priority** | 1 (highest) to 10 (lowest) -- higher priority zones get solar surplus first |
+| **Minimum cycle time** | (Optional, default 5) Minimum minutes the heater must stay on or off before switching |
 
 ## How it works
 
@@ -126,6 +142,36 @@ The scheduler iteratively picks the globally cheapest `(device, slot)` pair:
 - **Solar surplus is a shared resource.** After device A claims 1000W of a 2000W surplus, device B sees only 1000W remaining.
 - **Priority breaks ties.** When two devices have the same cost for the same slot, the higher-priority device wins.
 - **Deadlines are absolute.** A device under deadline pressure is forced on regardless of cost.
+
+### Thermostat control
+
+Thermostat devices use a different algorithm from switch devices. Instead of scheduling fixed runtime, they maintain a target temperature within a configurable margin while optimizing *when* to heat.
+
+#### Three-tier decision model
+
+1. **FORCE ON** -- Temperature at or below the lower bound (target - margin). Zeus turns on the heater regardless of price. Comfort is guaranteed.
+2. **FORCE OFF** -- Temperature at or above the upper bound (target + margin). Zeus turns off the heater regardless of price.
+3. **OPTIMIZE** -- Temperature within the margin. Zeus decides based on price, solar, and urgency.
+
+#### Urgency-weighted price threshold
+
+Within the margin range, Zeus computes an *urgency score* (0.0 at upper bound, 1.0 at lower bound). It then compares the current price's rank against upcoming prices:
+
+- **Urgency 0.3** (near upper bound): only heat if the current price is in the bottom 30% of upcoming prices
+- **Urgency 0.7** (near lower bound): heat if the current price is in the bottom 70%
+- **Urgency 1.0**: always heat (equivalent to FORCE ON)
+
+This means Zeus pre-heats during cheap slots (pushing temperature toward the upper margin) and coasts through expensive slots (letting temperature drift toward the lower margin).
+
+#### Solar-aware decisions
+
+- **Solar surplus available**: Always heat -- free energy is always used
+- **Solar forecast look-ahead**: If urgency is low and solar surplus is expected in the next 1-3 slots, Zeus coasts and waits for free energy
+- **High urgency overrides solar wait**: If temperature is approaching the lower bound, Zeus heats immediately even if solar is coming soon
+
+#### Multi-device solar sharing
+
+Thermostat devices share solar surplus with switch devices. Devices are processed by priority (1 = highest). Higher-priority zones consume solar first; lower-priority zones see reduced surplus and may need to use grid power.
 
 ### Real-time solar surplus
 
@@ -211,6 +257,7 @@ The recommended output sensor includes these extra attributes when a forecast en
 |---|---|
 | **Negative energy price** | ON when the current price is negative |
 | **{Device} schedule** | ON when Zeus wants the device running (per switch device) |
+| **{Device} heating** | ON when Zeus wants the heater running (per thermostat device) |
 
 The device schedule binary sensor includes these attributes:
 
@@ -234,6 +281,32 @@ Possible schedule reasons:
 - `Forced on: deadline pressure` -- must run, no time to wait
 - `Waiting for cheaper slot` -- a better slot is coming
 - `Daily runtime already met` -- done for the day
+
+The thermostat heating binary sensor includes these attributes:
+
+- `managed_entity` -- the switch entity being controlled
+- `power_sensor` -- the power monitoring sensor
+- `current_usage_w` -- live power draw
+- `peak_usage_w` -- configured peak power
+- `temperature_sensor` -- the temperature sensor entity
+- `current_temperature` -- live temperature reading
+- `target_temperature` -- configured target
+- `temperature_margin` -- configured margin
+- `lower_bound` / `upper_bound` -- computed comfort range
+- `priority` -- configured priority
+- `min_cycle_time_min` -- configured minimum cycle time
+- `cycle_locked` -- whether the heater is held by the cycle guard
+- `heating_reason` -- human-readable explanation of the current decision
+
+Possible heating reasons:
+
+- `Forced on: temperature X.X C at or below minimum Y.Y C`
+- `Forced off: temperature X.X C at or above maximum Y.Y C`
+- `Heating: solar surplus available`
+- `Heating: cheap price (rank N%, urgency M%)`
+- `Coasting: waiting for cheaper slot (rank N%, urgency M%)`
+- `Coasting: solar surplus expected soon`
+- `No temperature reading -- holding current state`
 
 ## Services
 

@@ -44,12 +44,16 @@ from .const import (
     CONF_PRIORITY,
     CONF_PRODUCTION_ENTITY,
     CONF_SWITCH_ENTITY,
+    CONF_TARGET_TEMPERATURE,
+    CONF_TEMPERATURE_MARGIN,
+    CONF_TEMPERATURE_SENSOR,
     DOMAIN,
     ENERGY_PROVIDER_TIBBER,
     ENERGY_PROVIDERS,
     SUBENTRY_HOME_MONITOR,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
+    SUBENTRY_THERMOSTAT_DEVICE,
 )
 from .tibber_api import TibberApiClient, TibberAuthError
 
@@ -152,6 +156,7 @@ class ZeusConfigFlow(ConfigFlow, domain=DOMAIN):
             SUBENTRY_SOLAR_INVERTER: SolarInverterSubentryFlow,
             SUBENTRY_HOME_MONITOR: HomeMonitorSubentryFlow,
             SUBENTRY_SWITCH_DEVICE: SwitchDeviceSubentryFlow,
+            SUBENTRY_THERMOSTAT_DEVICE: ThermostatDeviceSubentryFlow,
         }
 
 
@@ -408,6 +413,115 @@ class SwitchDeviceSubentryFlow(ConfigSubentryFlow):
             step_id="reconfigure",
             data_schema=self.add_suggested_values_to_schema(
                 _switch_device_schema(),
+                {"name": subentry.title, **subentry.data},
+            ),
+        )
+
+
+def _thermostat_device_schema() -> vol.Schema:
+    """Return the schema for a thermostat device subentry."""
+    return vol.Schema(
+        {
+            vol.Required("name"): str,
+            vol.Required(CONF_SWITCH_ENTITY): EntitySelector(
+                EntitySelectorConfig(domain=["switch", "input_boolean"])
+            ),
+            vol.Required(CONF_POWER_SENSOR): EntitySelector(
+                EntitySelectorConfig(
+                    domain="sensor",
+                    device_class="power",
+                )
+            ),
+            vol.Required(CONF_TEMPERATURE_SENSOR): EntitySelector(
+                EntitySelectorConfig(
+                    domain="sensor",
+                    device_class="temperature",
+                )
+            ),
+            vol.Required(CONF_PEAK_USAGE): NumberSelector(
+                NumberSelectorConfig(
+                    min=0,
+                    max=10000,
+                    step=1,
+                    unit_of_measurement="W",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(CONF_TARGET_TEMPERATURE, default=20.0): NumberSelector(
+                NumberSelectorConfig(
+                    min=5,
+                    max=30,
+                    step=0.5,
+                    unit_of_measurement="\u00b0C",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(CONF_TEMPERATURE_MARGIN, default=1.5): NumberSelector(
+                NumberSelectorConfig(
+                    min=0.5,
+                    max=5.0,
+                    step=0.5,
+                    unit_of_measurement="\u00b0C",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(CONF_PRIORITY, default=5): NumberSelector(
+                NumberSelectorConfig(
+                    min=1,
+                    max=10,
+                    step=1,
+                    mode=NumberSelectorMode.SLIDER,
+                )
+            ),
+            vol.Optional(CONF_MIN_CYCLE_TIME, default=5): NumberSelector(
+                NumberSelectorConfig(
+                    min=0,
+                    max=60,
+                    step=1,
+                    unit_of_measurement="min",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+        }
+    )
+
+
+class ThermostatDeviceSubentryFlow(ConfigSubentryFlow):
+    """Handle subentry flow for adding a thermostat device."""
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Handle the thermostat device configuration step."""
+        if user_input is not None:
+            return self.async_create_entry(
+                title=user_input.get("name", "Thermostat Device"),
+                data=user_input,
+            )
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=_thermostat_device_schema(),
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Handle reconfiguration of a thermostat device."""
+        subentry = self._get_reconfigure_subentry()
+
+        if user_input is not None:
+            return self.async_update_reload_and_abort(
+                self._get_entry(),
+                subentry,
+                title=user_input.get("name", subentry.title),
+                data=user_input,
+            )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                _thermostat_device_schema(),
                 {"name": subentry.title, **subentry.data},
             ),
         )

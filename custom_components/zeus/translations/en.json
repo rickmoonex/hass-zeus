@@ -171,6 +171,68 @@
       "abort": {
         "reconfigure_successful": "Switch device reconfigured successfully"
       }
+    },
+    "thermostat_device": {
+      "entry_type": "Thermostat Device",
+      "initiate_flow": {
+        "user": "Add thermostat device",
+        "reconfigure": "Reconfigure thermostat device"
+      },
+      "step": {
+        "user": {
+          "title": "Add thermostat device",
+          "description": "Configure a heating zone managed by Zeus as a software thermostat. Zeus maintains the target temperature within the margin while optimizing energy cost.",
+          "data": {
+            "name": "Name",
+            "switch_entity": "Switch entity",
+            "power_sensor": "Power sensor",
+            "temperature_sensor": "Temperature sensor",
+            "peak_usage": "Peak power usage",
+            "target_temperature": "Target temperature",
+            "temperature_margin": "Temperature margin",
+            "priority": "Priority",
+            "min_cycle_time": "Minimum cycle time"
+          },
+          "data_description": {
+            "switch_entity": "Switch or input_boolean entity that controls the heater (e.g., a smart plug).",
+            "power_sensor": "Sensor entity that reports the current power consumption of the heater in watts.",
+            "temperature_sensor": "Sensor entity that reports the current zone temperature in degrees Celsius.",
+            "peak_usage": "Peak power consumption of the heater in watts.",
+            "target_temperature": "Desired temperature for this zone in degrees Celsius.",
+            "temperature_margin": "Allowed deviation from target temperature. Zeus keeps the temperature within target +/- margin.",
+            "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority zones get solar surplus first.",
+            "min_cycle_time": "Minimum time in minutes the heater must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure thermostat device",
+          "description": "Update the thermostat device configuration.",
+          "data": {
+            "name": "Name",
+            "switch_entity": "Switch entity",
+            "power_sensor": "Power sensor",
+            "temperature_sensor": "Temperature sensor",
+            "peak_usage": "Peak power usage",
+            "target_temperature": "Target temperature",
+            "temperature_margin": "Temperature margin",
+            "priority": "Priority",
+            "min_cycle_time": "Minimum cycle time"
+          },
+          "data_description": {
+            "switch_entity": "Switch or input_boolean entity that controls the heater (e.g., a smart plug).",
+            "power_sensor": "Sensor entity that reports the current power consumption of the heater in watts.",
+            "temperature_sensor": "Sensor entity that reports the current zone temperature in degrees Celsius.",
+            "peak_usage": "Peak power consumption of the heater in watts.",
+            "target_temperature": "Desired temperature for this zone in degrees Celsius.",
+            "temperature_margin": "Allowed deviation from target temperature. Zeus keeps the temperature within target +/- margin.",
+            "priority": "Scheduling priority (1 = highest, 10 = lowest). Higher priority zones get solar surplus first.",
+            "min_cycle_time": "Minimum time in minutes the heater must stay on or off before switching. Protects the device from rapid toggling. Set to 0 to disable."
+          }
+        }
+      },
+      "abort": {
+        "reconfigure_successful": "Thermostat device reconfigured successfully"
+      }
     }
   },
   "selector": {
@@ -226,6 +288,9 @@
       },
       "device_runtime_today": {
         "name": "{device_name} runtime today"
+      },
+      "thermostat_runtime_today": {
+        "name": "{device_name} heating runtime today"
       }
     },
     "binary_sensor": {
@@ -234,6 +299,9 @@
       },
       "device_schedule": {
         "name": "{device_name} schedule"
+      },
+      "thermostat_schedule": {
+        "name": "{device_name} heating"
       }
     },
     "switch": {

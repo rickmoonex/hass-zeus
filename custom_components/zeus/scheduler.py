@@ -31,9 +31,13 @@ from .const import (
     CONF_PRIORITY,
     CONF_PRODUCTION_ENTITY,
     CONF_SWITCH_ENTITY,
+    CONF_TARGET_TEMPERATURE,
+    CONF_TEMPERATURE_MARGIN,
+    CONF_TEMPERATURE_SENSOR,
     SUBENTRY_HOME_MONITOR,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
+    SUBENTRY_THERMOSTAT_DEVICE,
 )
 from .coordinator import PriceCoordinator, PriceSlot
 
@@ -98,6 +102,52 @@ class ScheduleResult:
     remaining_runtime_min: float
     scheduled_slots: list[datetime] = field(default_factory=list)
     reason: str = ""
+
+
+@dataclass
+class ThermostatScheduleRequest:
+    """A thermostat device requesting temperature-managed scheduling."""
+
+    subentry_id: str
+    name: str
+    switch_entity: str
+    power_sensor: str
+    temperature_sensor: str
+    peak_usage_w: float
+    target_temperature: float
+    temperature_margin: float
+    priority: int
+    min_cycle_time_min: float = 5.0
+    # Live state (populated at runtime)
+    current_temperature: float | None = None
+    is_on: bool = False
+    actual_usage_w: float | None = None
+
+    @property
+    def lower_bound(self) -> float:
+        """Temperature at which heating is forced on."""
+        return self.target_temperature - self.temperature_margin
+
+    @property
+    def upper_bound(self) -> float:
+        """Temperature at which heating is forced off."""
+        return self.target_temperature + self.temperature_margin
+
+    @property
+    def temp_urgency(self) -> float:
+        """
+        How urgently heating is needed (0.0 = at upper bound, 1.0 = at lower bound).
+
+        Returns 0.5 if no temperature reading is available.
+        """
+        if self.current_temperature is None:
+            return 0.5
+        margin_range = self.upper_bound - self.lower_bound
+        if margin_range <= 0:
+            return 0.5
+        return max(
+            0.0, min(1.0, (self.upper_bound - self.current_temperature) / margin_range)
+        )
 
 
 def _get_state_changes(
@@ -259,6 +309,32 @@ def _build_device_requests(
                 deadline=deadline_time,
                 priority=int(data.get(CONF_PRIORITY, 5)),
                 min_cycle_time_min=float(data.get(CONF_MIN_CYCLE_TIME, 0)),
+            )
+        )
+    return requests
+
+
+def _build_thermostat_requests(
+    entry: ConfigEntry,
+) -> list[ThermostatScheduleRequest]:
+    """Build thermostat schedule requests from thermostat device subentries."""
+    requests = []
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != SUBENTRY_THERMOSTAT_DEVICE:
+            continue
+        data = subentry.data
+        requests.append(
+            ThermostatScheduleRequest(
+                subentry_id=subentry.subentry_id,
+                name=subentry.title,
+                switch_entity=data[CONF_SWITCH_ENTITY],
+                power_sensor=data[CONF_POWER_SENSOR],
+                temperature_sensor=data[CONF_TEMPERATURE_SENSOR],
+                peak_usage_w=float(data[CONF_PEAK_USAGE]),
+                target_temperature=float(data[CONF_TARGET_TEMPERATURE]),
+                temperature_margin=float(data[CONF_TEMPERATURE_MARGIN]),
+                priority=int(data.get(CONF_PRIORITY, 5)),
+                min_cycle_time_min=float(data.get(CONF_MIN_CYCLE_TIME, 5)),
             )
         )
     return requests
@@ -723,42 +799,20 @@ async def async_run_scheduler(
     entry: ConfigEntry,
     coordinator: PriceCoordinator,
 ) -> dict[str, ScheduleResult]:
-    """Run the full scheduling cycle."""
-    # Build device requests
-    devices = _build_device_requests(entry)
-    if not devices:
-        return {}
+    """Run the full scheduling cycle for switch and thermostat devices."""
+    results: dict[str, ScheduleResult] = {}
 
-    # Query runtime today and live state for each device
-    for device in devices:
-        device.runtime_today_min = await async_get_runtime_today_minutes(
-            hass, device.switch_entity
-        )
-        # Read live switch state and power draw
-        switch_state = hass.states.get(device.switch_entity)
-        device.is_on = switch_state is not None and switch_state.state == "on"
-        power_state = hass.states.get(device.power_sensor)
-        if power_state and power_state.state not in ("unknown", "unavailable"):
-            try:
-                device.actual_usage_w = float(power_state.state)
-            except (ValueError, TypeError):
-                device.actual_usage_w = None
-
-    # Get current price slots from coordinator
+    # Get shared data: price slots, solar forecast, home consumption, live surplus
     price_slots = _get_all_future_slots(coordinator)
-
-    # Get solar forecast (optional)
     solar_forecast = await async_get_solar_forecast(hass)
     _LOGGER.debug(
         "Scheduler: solar_forecast=%s",
         f"present ({len(solar_forecast)} entries)" if solar_forecast else "None",
     )
 
-    # Get home consumption (if available)
     home_consumption_w = _get_home_consumption(hass, entry)
     _LOGGER.debug("Scheduler: home_consumption_w=%.1f", home_consumption_w)
 
-    # Get live solar surplus for the current moment (production - consumption)
     live_solar_surplus_w = _get_live_solar_surplus(hass, entry, home_consumption_w)
     _LOGGER.debug(
         "Scheduler: live_solar_surplus_w=%s",
@@ -767,14 +821,67 @@ async def async_run_scheduler(
 
     now = dt_util.now()
 
-    return compute_schedules(
-        devices,
-        price_slots,
-        solar_forecast,
-        home_consumption_w,
-        now,
-        live_solar_surplus_w=live_solar_surplus_w,
-    )
+    # --- Switch devices ---
+    devices = _build_device_requests(entry)
+    if devices:
+        for device in devices:
+            device.runtime_today_min = await async_get_runtime_today_minutes(
+                hass, device.switch_entity
+            )
+            switch_state = hass.states.get(device.switch_entity)
+            device.is_on = switch_state is not None and switch_state.state == "on"
+            power_state = hass.states.get(device.power_sensor)
+            if power_state and power_state.state not in ("unknown", "unavailable"):
+                try:
+                    device.actual_usage_w = float(power_state.state)
+                except (ValueError, TypeError):
+                    device.actual_usage_w = None
+
+        results.update(
+            compute_schedules(
+                devices,
+                price_slots,
+                solar_forecast,
+                home_consumption_w,
+                now,
+                live_solar_surplus_w=live_solar_surplus_w,
+            )
+        )
+
+    # --- Thermostat devices ---
+    thermostats = _build_thermostat_requests(entry)
+    if thermostats:
+        for therm in thermostats:
+            # Read live temperature
+            temp_state = hass.states.get(therm.temperature_sensor)
+            if temp_state and temp_state.state not in ("unknown", "unavailable"):
+                try:
+                    therm.current_temperature = float(temp_state.state)
+                except (ValueError, TypeError):
+                    therm.current_temperature = None
+
+            # Read live switch state and power draw
+            switch_state = hass.states.get(therm.switch_entity)
+            therm.is_on = switch_state is not None and switch_state.state == "on"
+            power_state = hass.states.get(therm.power_sensor)
+            if power_state and power_state.state not in ("unknown", "unavailable"):
+                try:
+                    therm.actual_usage_w = float(power_state.state)
+                except (ValueError, TypeError):
+                    therm.actual_usage_w = None
+
+        results.update(
+            compute_thermostat_decisions(
+                thermostats,
+                price_slots,
+                solar_forecast,
+                home_consumption_w,
+                now,
+                live_solar_surplus_w=live_solar_surplus_w,
+            )
+        )
+
+    return results
 
 
 def _get_all_future_slots(coordinator: PriceCoordinator) -> list[PriceSlot]:
@@ -834,3 +941,261 @@ def _get_live_solar_surplus(
                     state.state,
                 )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Thermostat decision engine
+# ---------------------------------------------------------------------------
+
+# Number of upcoming slots to consider for price comparison
+_THERMOSTAT_LOOKAHEAD_SLOTS = 8
+
+# Urgency threshold below which we consider waiting for solar
+_SOLAR_WAIT_URGENCY_THRESHOLD = 0.6
+
+# Urgency threshold for fallback (no price data) decisions
+_URGENCY_FALLBACK_THRESHOLD = 0.5
+
+
+def _percentile_rank(value: float, values: list[float]) -> float:
+    """
+    Compute the percentile rank of *value* within *values* (0.0 to 1.0).
+
+    A rank of 0.0 means *value* is the cheapest; 1.0 means the most expensive.
+    Returns 0.5 if *values* is empty.
+    """
+    if not values:
+        return 0.5
+    count_below = sum(1 for v in values if v < value)
+    return count_below / len(values)
+
+
+def compute_thermostat_decisions(  # noqa: PLR0913
+    thermostats: list[ThermostatScheduleRequest],
+    price_slots: list[PriceSlot],
+    solar_forecast: dict[str, Any] | None,
+    home_consumption_w: float,
+    now: datetime,
+    live_solar_surplus_w: float | None = None,
+) -> dict[str, ScheduleResult]:
+    """
+    Compute heating decisions for all thermostat devices.
+
+    Unlike switch devices (which use slot-based runtime scheduling), thermostat
+    devices use a real-time decision engine based on temperature state, price
+    context, and solar availability.
+
+    The algorithm uses three tiers:
+    1. FORCE ON  -- temperature at or below lower bound (target - margin)
+    2. FORCE OFF -- temperature at or above upper bound (target + margin)
+    3. OPTIMIZE  -- within margin, decide based on price, solar, and urgency
+
+    Devices are processed by priority (1 = highest) so that higher-priority
+    zones consume solar surplus first, leaving less for lower-priority zones.
+    """
+    if not thermostats:
+        return {}
+
+    # Build slot info for solar awareness (reuse existing infrastructure)
+    slot_info = _build_slot_info(
+        price_slots, solar_forecast, home_consumption_w, now, live_solar_surplus_w
+    )
+    current_slot_start = _get_current_slot_start(now)
+
+    # Get current and upcoming price slots for comparison
+    current_slot = slot_info.get(current_slot_start)
+    upcoming_slots = sorted(
+        (s for st, s in slot_info.items() if st > current_slot_start),
+        key=lambda s: s.start_time,
+    )[:_THERMOSTAT_LOOKAHEAD_SLOTS]
+
+    upcoming_prices = [s.price for s in upcoming_slots]
+
+    # Sort by priority (1 = highest) for deterministic solar allocation
+    sorted_thermostats = sorted(thermostats, key=lambda t: t.priority)
+
+    results: dict[str, ScheduleResult] = {}
+
+    for thermostat in sorted_thermostats:
+        result = _decide_thermostat(
+            thermostat,
+            current_slot,
+            upcoming_prices,
+            upcoming_slots,
+            slot_info,
+            current_slot_start,
+        )
+        results[thermostat.subentry_id] = result
+
+        # Consume solar surplus if this thermostat will heat
+        if result.should_be_on and current_slot_start in slot_info:
+            info = slot_info[current_slot_start]
+            consumption = thermostat.actual_usage_w or thermostat.peak_usage_w
+            info.remaining_solar_w = max(0.0, info.remaining_solar_w - consumption)
+
+    return results
+
+
+def _decide_thermostat(  # noqa: PLR0913
+    thermostat: ThermostatScheduleRequest,
+    current_slot: _SlotInfo | None,
+    upcoming_prices: list[float],
+    upcoming_slots: list[_SlotInfo],
+    slot_info: dict[datetime, _SlotInfo],
+    current_slot_start: datetime,
+) -> ScheduleResult:
+    """
+    Decide whether a single thermostat device should heat right now.
+
+    Returns a ScheduleResult with should_be_on and a descriptive reason.
+    """
+    temp = thermostat.current_temperature
+    lower = thermostat.lower_bound
+    upper = thermostat.upper_bound
+
+    # No temperature reading — safe fallback based on current state
+    if temp is None:
+        return ScheduleResult(
+            subentry_id=thermostat.subentry_id,
+            should_be_on=thermostat.is_on,
+            remaining_runtime_min=0.0,
+            scheduled_slots=[current_slot_start] if thermostat.is_on else [],
+            reason="No temperature reading \u2014 holding current state",
+        )
+
+    # Tier 1: FORCE ON — below minimum temperature
+    if temp <= lower:
+        return ScheduleResult(
+            subentry_id=thermostat.subentry_id,
+            should_be_on=True,
+            remaining_runtime_min=0.0,
+            scheduled_slots=[current_slot_start],
+            reason=(
+                f"Forced on: temperature {temp:.1f}\u00b0C"
+                f" at or below minimum {lower:.1f}\u00b0C"
+            ),
+        )
+
+    # Tier 2: FORCE OFF — above maximum temperature
+    if temp >= upper:
+        return ScheduleResult(
+            subentry_id=thermostat.subentry_id,
+            should_be_on=False,
+            remaining_runtime_min=0.0,
+            scheduled_slots=[],
+            reason=(
+                f"Forced off: temperature {temp:.1f}\u00b0C"
+                f" at or above maximum {upper:.1f}\u00b0C"
+            ),
+        )
+
+    # Tier 3: OPTIMIZE — within margin, decide based on price/solar/urgency
+    return _decide_thermostat_optimized(
+        thermostat,
+        current_slot,
+        upcoming_prices,
+        upcoming_slots,
+        slot_info,
+        current_slot_start,
+    )
+
+
+def _decide_thermostat_optimized(  # noqa: PLR0913
+    thermostat: ThermostatScheduleRequest,
+    current_slot: _SlotInfo | None,
+    upcoming_prices: list[float],
+    upcoming_slots: list[_SlotInfo],
+    slot_info: dict[datetime, _SlotInfo],  # noqa: ARG001
+    current_slot_start: datetime,
+) -> ScheduleResult:
+    """
+    Optimization logic when temperature is within the margin range.
+
+    Uses urgency-weighted price threshold: the closer to the lower margin,
+    the more willing Zeus is to accept higher-priced slots for heating.
+    Solar surplus is always used (free energy). Solar forecast is considered
+    for look-ahead: coast if free solar is expected soon.
+    """
+    urgency = thermostat.temp_urgency
+
+    # Check solar surplus availability in current slot
+    has_solar = False
+    if current_slot is not None:
+        has_solar = current_slot.remaining_solar_w >= thermostat.peak_usage_w
+
+    # Solar surplus available — always heat (free energy)
+    if has_solar:
+        return ScheduleResult(
+            subentry_id=thermostat.subentry_id,
+            should_be_on=True,
+            remaining_runtime_min=0.0,
+            scheduled_slots=[current_slot_start],
+            reason="Heating: solar surplus available",
+        )
+
+    # Solar forecast look-ahead: if urgency is low and solar is coming soon, coast
+    if urgency < _SOLAR_WAIT_URGENCY_THRESHOLD and _solar_coming_soon(
+        upcoming_slots, thermostat.peak_usage_w
+    ):
+        return ScheduleResult(
+            subentry_id=thermostat.subentry_id,
+            should_be_on=False,
+            remaining_runtime_min=0.0,
+            scheduled_slots=[],
+            reason="Coasting: solar surplus expected soon",
+        )
+
+    # Price-based decision: urgency-weighted threshold
+    if current_slot is not None and upcoming_prices:
+        price_rank = _percentile_rank(current_slot.price, upcoming_prices)
+
+        # Urgency-weighted threshold:
+        # urgency 0.3 (near upper) → heat only if price in bottom 30%
+        # urgency 0.7 (near lower) → heat if price in bottom 70%
+        # urgency 1.0 → always heat (but this is caught by FORCE ON above)
+        if price_rank <= urgency:
+            return ScheduleResult(
+                subentry_id=thermostat.subentry_id,
+                should_be_on=True,
+                remaining_runtime_min=0.0,
+                scheduled_slots=[current_slot_start],
+                reason=(
+                    f"Heating: cheap price"
+                    f" (rank {price_rank:.0%}, urgency {urgency:.0%})"
+                ),
+            )
+
+        return ScheduleResult(
+            subentry_id=thermostat.subentry_id,
+            should_be_on=False,
+            remaining_runtime_min=0.0,
+            scheduled_slots=[],
+            reason=(
+                f"Coasting: waiting for cheaper slot"
+                f" (rank {price_rank:.0%}, urgency {urgency:.0%})"
+            ),
+        )
+
+    # No price data — fall back to heating if urgency is above threshold
+    should_heat = urgency > _URGENCY_FALLBACK_THRESHOLD
+    return ScheduleResult(
+        subentry_id=thermostat.subentry_id,
+        should_be_on=should_heat,
+        remaining_runtime_min=0.0,
+        scheduled_slots=[current_slot_start] if should_heat else [],
+        reason="Heating: no price data, urgency-based fallback"
+        if should_heat
+        else "Coasting: no price data, urgency-based fallback",
+    )
+
+
+def _solar_coming_soon(
+    upcoming_slots: list[_SlotInfo],
+    device_peak_w: float,
+    max_slots_ahead: int = 3,
+) -> bool:
+    """Check if any upcoming slot (within max_slots_ahead) has enough solar surplus."""
+    for slot in upcoming_slots[:max_slots_ahead]:
+        if slot.remaining_solar_w >= device_peak_w:
+            return True
+    return False

@@ -27,10 +27,12 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_PRODUCTION_ENTITY,
+    CONF_TEMPERATURE_SENSOR,
     DOMAIN,
     ENERGY_PROVIDER_TIBBER,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
+    SUBENTRY_THERMOSTAT_DEVICE,
 )
 from .tibber_api import TibberApiClient, TibberApiError
 
@@ -89,6 +91,7 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         self._cached_slots: dict[str, dict[datetime, PriceSlot]] = {}
         self._slot_unsub: CALLBACK_TYPE | None = None
         self._solar_unsub: CALLBACK_TYPE | None = None
+        self._temp_unsub: CALLBACK_TYPE | None = None
         self._price_override: float | None = None
         self.schedule_results: dict[str, ScheduleResult] = {}
         self._scheduler_module: Any | None = None
@@ -147,7 +150,7 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
                 if entity_id:
                     entity_ids.append(entity_id)
 
-        if not entity_ids or not self._has_switch_devices():
+        if not entity_ids or not self._has_managed_devices():
             return
 
         @callback
@@ -168,6 +171,40 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
             self._solar_unsub()
             self._solar_unsub = None
 
+    @callback
+    def _async_start_temperature_listener(self) -> None:
+        """Listen for temperature changes to trigger thermostat re-evaluation."""
+        if self._temp_unsub is not None or self.config_entry is None:
+            return
+
+        entity_ids: list[str] = []
+        for subentry in self.config_entry.subentries.values():
+            if subentry.subentry_type == SUBENTRY_THERMOSTAT_DEVICE:
+                entity_id = subentry.data.get(CONF_TEMPERATURE_SENSOR)
+                if entity_id:
+                    entity_ids.append(entity_id)
+
+        if not entity_ids:
+            return
+
+        @callback
+        def _on_temp_change(
+            _event: Event[EventStateChangedData],
+        ) -> None:
+            """Rerun scheduler when temperature changes."""
+            self.hass.async_create_task(self._async_slot_update())
+
+        self._temp_unsub = async_track_state_change_event(
+            self.hass, entity_ids, _on_temp_change
+        )
+
+    @callback
+    def _async_stop_temperature_listener(self) -> None:
+        """Stop listening for temperature changes."""
+        if self._temp_unsub is not None:
+            self._temp_unsub()
+            self._temp_unsub = None
+
     async def _async_slot_update(self) -> None:
         """Run scheduler and re-notify listeners on 15-min boundary."""
         await self.async_run_scheduler()
@@ -182,9 +219,10 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
             msg = f"Unsupported energy provider: {self.provider}"
             raise UpdateFailed(msg)
 
-        # Start the slot timer and solar listener after the first successful fetch
+        # Start the slot timer and listeners after the first successful fetch
         self._async_start_slot_timer()
         self._async_start_solar_listener()
+        self._async_start_temperature_listener()
         return result
 
     async def _fetch_tibber_prices(self) -> dict[str, list[PriceSlot]]:
@@ -332,12 +370,12 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         slot = self.get_next_slot()
         return slot.price if slot else None
 
-    def _has_switch_devices(self) -> bool:
-        """Check if any switch device subentries are configured."""
+    def _has_managed_devices(self) -> bool:
+        """Check if any managed device subentries are configured."""
         if self.config_entry is None:
             return False
         return any(
-            s.subentry_type == SUBENTRY_SWITCH_DEVICE
+            s.subentry_type in (SUBENTRY_SWITCH_DEVICE, SUBENTRY_THERMOSTAT_DEVICE)
             for s in self.config_entry.subentries.values()
         )
 
@@ -350,7 +388,7 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         """
         if (
             not self._enabled
-            or not self._has_switch_devices()
+            or not self._has_managed_devices()
             or self.config_entry is None
         ):
             self.schedule_results = {}
@@ -374,4 +412,5 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         """Shut down the coordinator and clean up timers."""
         self._async_stop_slot_timer()
         self._async_stop_solar_listener()
+        self._async_stop_temperature_listener()
         await super().async_shutdown()

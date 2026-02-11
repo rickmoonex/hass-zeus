@@ -30,6 +30,7 @@ from .const import (
     SUBENTRY_HOME_MONITOR,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
+    SUBENTRY_THERMOSTAT_DEVICE,
 )
 from .coordinator import PriceCoordinator
 
@@ -95,6 +96,18 @@ async def async_setup_entry(
             async_add_entities(
                 [
                     ZeusDeviceRuntimeTodaySensor(
+                        coordinator, entry, subentry.subentry_id, hass
+                    ),
+                ],
+                config_subentry_id=subentry.subentry_id,
+            )
+
+    # Per-thermostat-device sensors (linked to their subentry)
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type == SUBENTRY_THERMOSTAT_DEVICE:
+            async_add_entities(
+                [
+                    ZeusThermostatRuntimeTodaySensor(
                         coordinator, entry, subentry.subentry_id, hass
                     ),
                 ],
@@ -868,3 +881,53 @@ def _get_device_info_for_switch(
         manufacturer="Zeus",
         entry_type=DeviceEntryType.SERVICE,
     )
+
+
+class ZeusThermostatRuntimeTodaySensor(
+    CoordinatorEntity[PriceCoordinator], SensorEntity
+):
+    """Minutes a thermostat device has been heating today."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "thermostat_runtime_today"
+    _attr_native_unit_of_measurement = "min"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 1
+
+    def __init__(
+        self,
+        coordinator: PriceCoordinator,
+        entry: ConfigEntry,
+        subentry_id: str,
+        hass: HomeAssistant,
+    ) -> None:
+        """Initialize the thermostat runtime today sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._subentry_id = subentry_id
+        self._attr_unique_id = (
+            f"{entry.entry_id}_{subentry_id}_thermostat_runtime_today"
+        )
+
+        subentry = entry.subentries.get(subentry_id)
+        device_name = subentry.title if subentry else "Thermostat Device"
+        self._attr_translation_placeholders = {
+            "device_name": device_name,
+        }
+
+        switch_entity = subentry.data[CONF_SWITCH_ENTITY] if subentry else ""
+        self._attr_device_info = _get_device_info_for_switch(
+            hass, switch_entity, entry, subentry_id, device_name
+        )
+
+        self._attr_native_value = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Update runtime from scheduler (thermostat tracks switch on-time)."""
+        # Thermostat results don't have remaining_runtime_min in the same
+        # way switch devices do, but we can query the switch's on-time
+        # through the scheduler. For now, this sensor updates when the
+        # coordinator provides new schedule results. The actual runtime
+        # tracking happens via the recorder in the scheduler module.
+        self.async_write_ha_state()

@@ -25,8 +25,12 @@ from .const import (
     CONF_POWER_SENSOR,
     CONF_PRIORITY,
     CONF_SWITCH_ENTITY,
+    CONF_TARGET_TEMPERATURE,
+    CONF_TEMPERATURE_MARGIN,
+    CONF_TEMPERATURE_SENSOR,
     DOMAIN,
     SUBENTRY_SWITCH_DEVICE,
+    SUBENTRY_THERMOSTAT_DEVICE,
 )
 from .coordinator import PriceCoordinator
 
@@ -52,6 +56,18 @@ async def async_setup_entry(
             async_add_entities(
                 [
                     ZeusDeviceScheduleSensor(
+                        coordinator, entry, subentry.subentry_id, hass
+                    )
+                ],
+                config_subentry_id=subentry.subentry_id,
+            )
+
+    # Per-thermostat-device binary sensors (linked to their subentry)
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type == SUBENTRY_THERMOSTAT_DEVICE:
+            async_add_entities(
+                [
+                    ZeusThermostatScheduleSensor(
                         coordinator, entry, subentry.subentry_id, hass
                     )
                 ],
@@ -323,6 +339,200 @@ class ZeusDeviceScheduleSensor(CoordinatorEntity[PriceCoordinator], BinarySensor
         try:
             await self.hass.services.async_call(
                 domain, service, {"entity_id": entity_id}, blocking=True
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Failed to %s %s", service, entity_id, exc_info=True)
+
+
+class ZeusThermostatScheduleSensor(
+    CoordinatorEntity[PriceCoordinator], BinarySensorEntity
+):
+    """
+    Binary sensor reporting whether Zeus wants a thermostat device heating.
+
+    ON means the thermostat decision engine has determined heating is
+    needed (forced on, cheap price, or solar surplus). The sensor also
+    directly controls the underlying switch entity.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "thermostat_schedule"
+
+    def __init__(
+        self,
+        coordinator: PriceCoordinator,
+        entry: ConfigEntry,
+        subentry_id: str,
+        hass: HomeAssistant,
+    ) -> None:
+        """Initialize the thermostat schedule binary sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._subentry_id = subentry_id
+        self._attr_unique_id = f"{entry.entry_id}_{subentry_id}_thermostat_schedule"
+
+        subentry = entry.subentries.get(subentry_id)
+        device_name = subentry.title if subentry else "Thermostat Device"
+        self._attr_translation_placeholders = {
+            "device_name": device_name,
+        }
+
+        switch_entity = subentry.data[CONF_SWITCH_ENTITY] if subentry else ""
+        self._attr_device_info = _get_device_info_for_entity(
+            hass, switch_entity, entry, subentry_id, device_name
+        )
+
+        # Read initial state from coordinator results
+        result = coordinator.schedule_results.get(subentry_id)
+        self._attr_is_on = result.should_be_on if result else False
+
+        # Track switch changes for min_cycle_time enforcement
+        self._last_switch_change: datetime | None = None
+        self._current_switch_state: bool | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Apply initial switch control when entity is added to HA."""
+        await super().async_added_to_hass()
+        if self._attr_is_on is not None:
+            switch_entity = self._subentry_data.get(CONF_SWITCH_ENTITY)
+            if switch_entity:
+                await self._async_control_switch(
+                    switch_entity, turn_on=self._attr_is_on
+                )
+
+    @property
+    def _subentry_data(self) -> dict[str, Any]:
+        """Get the subentry data for this thermostat device."""
+        subentry = self._entry.subentries.get(self._subentry_id)
+        if subentry is None:
+            return {}
+        return dict(subentry.data)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra state attributes."""
+        data = self._subentry_data
+
+        # Read current temperature
+        current_temp: float | None = None
+        temp_sensor = data.get(CONF_TEMPERATURE_SENSOR)
+        if temp_sensor and self.hass is not None:
+            state = self.hass.states.get(temp_sensor)
+            if state and state.state not in ("unknown", "unavailable"):
+                with contextlib.suppress(ValueError, TypeError):
+                    current_temp = float(state.state)
+
+        # Read current power usage
+        power_sensor = data.get(CONF_POWER_SENSOR)
+        current_usage_w: float | None = None
+        if power_sensor and self.hass is not None:
+            state = self.hass.states.get(power_sensor)
+            if state and state.state not in ("unknown", "unavailable"):
+                with contextlib.suppress(ValueError, TypeError):
+                    current_usage_w = float(state.state)
+
+        target = float(data.get(CONF_TARGET_TEMPERATURE, 20.0))
+        margin = float(data.get(CONF_TEMPERATURE_MARGIN, 1.5))
+        min_cycle = float(data.get(CONF_MIN_CYCLE_TIME, 5))
+
+        attrs: dict[str, Any] = {
+            "managed_entity": data.get(CONF_SWITCH_ENTITY),
+            "power_sensor": power_sensor,
+            "current_usage_w": current_usage_w,
+            "peak_usage_w": data.get(CONF_PEAK_USAGE),
+            "temperature_sensor": temp_sensor,
+            "current_temperature": current_temp,
+            "target_temperature": target,
+            "temperature_margin": margin,
+            "lower_bound": target - margin,
+            "upper_bound": target + margin,
+            "priority": data.get(CONF_PRIORITY),
+            "min_cycle_time_min": min_cycle,
+            "cycle_locked": self._is_cycle_locked(desired_on=not self._attr_is_on)
+            if self._attr_is_on is not None
+            else False,
+        }
+
+        result = self.coordinator.schedule_results.get(self._subentry_id)
+        if result:
+            attrs["heating_reason"] = result.reason
+
+        return attrs
+
+    def _get_min_cycle_time_min(self) -> float:
+        """Get the minimum cycle time in minutes from config."""
+        return float(self._subentry_data.get(CONF_MIN_CYCLE_TIME, 5))
+
+    def _is_cycle_locked(self, *, desired_on: bool) -> bool:
+        """Check if switching is blocked by minimum cycle time."""
+        min_cycle = self._get_min_cycle_time_min()
+        if min_cycle <= 0:
+            return False
+        if self._last_switch_change is None or self._current_switch_state is None:
+            return False
+        if desired_on == self._current_switch_state:
+            return False
+        elapsed_min = (
+            dt_util.utcnow() - self._last_switch_change
+        ).total_seconds() / 60.0
+        if elapsed_min < min_cycle:
+            _LOGGER.debug(
+                "Cycle lock: %s must stay %s for %.1f more min",
+                self._subentry_data.get(CONF_SWITCH_ENTITY),
+                "on" if self._current_switch_state else "off",
+                min_cycle - elapsed_min,
+            )
+            return True
+        return False
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle coordinator update — apply thermostat decision."""
+        if not self.coordinator.enabled:
+            if self._attr_is_on:
+                self._attr_is_on = False
+                switch_entity = self._subentry_data.get(CONF_SWITCH_ENTITY)
+                if switch_entity:
+                    self.hass.async_create_task(
+                        self._async_control_switch(switch_entity, turn_on=False)
+                    )
+            self.async_write_ha_state()
+            return
+
+        result = self.coordinator.schedule_results.get(self._subentry_id)
+        if result is None:
+            return
+
+        desired_on = result.should_be_on
+
+        if self._is_cycle_locked(desired_on=desired_on):
+            self.async_write_ha_state()
+            return
+
+        self._attr_is_on = desired_on
+
+        switch_entity = self._subentry_data.get(CONF_SWITCH_ENTITY)
+        if switch_entity:
+            self.hass.async_create_task(
+                self._async_control_switch(switch_entity, turn_on=desired_on)
+            )
+
+        self.async_write_ha_state()
+
+    async def _async_control_switch(self, entity_id: str, *, turn_on: bool) -> None:
+        """Turn on or off the underlying switch entity."""
+        if self._current_switch_state != turn_on:
+            self._last_switch_change = dt_util.utcnow()
+            self._current_switch_state = turn_on
+
+        domain = entity_id.split(".", maxsplit=1)[0]
+        service = "turn_on" if turn_on else "turn_off"
+        try:
+            await self.hass.services.async_call(
+                domain,
+                service,
+                {"entity_id": entity_id},
+                blocking=True,
             )
         except Exception:  # noqa: BLE001
             _LOGGER.warning("Failed to %s %s", service, entity_id, exc_info=True)
