@@ -47,13 +47,21 @@
             "production_entity": "Current production entity",
             "output_control_entity": "Output control entity",
             "max_power_output": "Maximum power output",
-            "forecast_entity": "Solar forecast entity"
+            "forecast_entity": "Solar forecast entity",
+            "solar_declination": "Panel declination",
+            "solar_azimuth": "Panel azimuth",
+            "solar_kwp": "Installed capacity",
+            "forecast_api_key": "Forecast.Solar API key"
           },
           "data_description": {
             "production_entity": "Sensor entity that reports the current solar production in watts.",
             "output_control_entity": "Number entity that controls the inverter output (0-100%).",
             "max_power_output": "The maximum power output of the inverter in watts.",
-            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes."
+            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes.",
+            "solar_declination": "Tilt angle of the solar panels in degrees (0 = horizontal, 90 = vertical).",
+            "solar_azimuth": "Compass direction the panels face in degrees (-180 = north, -90 = east, 0 = south, 90 = west).",
+            "solar_kwp": "Total installed peak power of this panel array in kilowatt-peak.",
+            "forecast_api_key": "Optional: Forecast.Solar API key for higher rate limits. Leave empty for the free tier (12 requests/hour)."
           }
         },
         "reconfigure": {
@@ -64,13 +72,21 @@
             "production_entity": "Current production entity",
             "output_control_entity": "Output control entity",
             "max_power_output": "Maximum power output",
-            "forecast_entity": "Solar forecast entity"
+            "forecast_entity": "Solar forecast entity",
+            "solar_declination": "Panel declination",
+            "solar_azimuth": "Panel azimuth",
+            "solar_kwp": "Installed capacity",
+            "forecast_api_key": "Forecast.Solar API key"
           },
           "data_description": {
             "production_entity": "Sensor entity that reports the current solar production in watts.",
             "output_control_entity": "Number entity that controls the inverter output (0-100%).",
             "max_power_output": "The maximum power output of the inverter in watts.",
-            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes."
+            "forecast_entity": "Power sensor from forecast.solar (e.g., Estimated power production - now). Used to expose forecast data as sensor attributes.",
+            "solar_declination": "Tilt angle of the solar panels in degrees (0 = horizontal, 90 = vertical).",
+            "solar_azimuth": "Compass direction the panels face in degrees (-180 = north, -90 = east, 0 = south, 90 = west).",
+            "solar_kwp": "Total installed peak power of this panel array in kilowatt-peak.",
+            "forecast_api_key": "Optional: Forecast.Solar API key for higher rate limits. Leave empty for the free tier (12 requests/hour)."
           }
         }
       },
@@ -247,6 +263,7 @@
            "data": {
             "name": "Name",
             "peak_usage": "Peak power usage",
+            "avg_usage": "Average power usage",
             "cycle_duration": "Cycle duration",
             "dynamic_cycle_duration": "Dynamic cycle duration",
             "power_sensor": "Power sensor",
@@ -254,7 +271,8 @@
             "priority": "Priority"
           },
           "data_description": {
-            "peak_usage": "Peak power consumption of the device in watts.",
+            "peak_usage": "Peak power consumption of the device in watts. Used to determine if solar surplus can fully cover the device.",
+            "avg_usage": "Average power consumption over a full cycle in watts. Used for cost calculation to give a realistic picture of actual energy use.",
             "cycle_duration": "Default cycle duration in minutes (e.g., 90 for a dishwasher).",
             "dynamic_cycle_duration": "Allow changing the cycle duration before each run. Enable for devices with variable program lengths (e.g., a dishwasher with different wash cycles).",
             "power_sensor": "Optional: sensor entity that reports the current power consumption in watts.",
@@ -268,6 +286,7 @@
           "data": {
             "name": "Name",
             "peak_usage": "Peak power usage",
+            "avg_usage": "Average power usage",
             "cycle_duration": "Cycle duration",
             "dynamic_cycle_duration": "Dynamic cycle duration",
             "power_sensor": "Power sensor",
@@ -275,7 +294,8 @@
             "priority": "Priority"
           },
           "data_description": {
-            "peak_usage": "Peak power consumption of the device in watts.",
+            "peak_usage": "Peak power consumption of the device in watts. Used to determine if solar surplus can fully cover the device.",
+            "avg_usage": "Average power consumption over a full cycle in watts. Used for cost calculation to give a realistic picture of actual energy use.",
             "cycle_duration": "Default cycle duration in minutes (e.g., 90 for a dishwasher).",
             "dynamic_cycle_duration": "Allow changing the cycle duration before each run. Enable for devices with variable program lengths (e.g., a dishwasher with different wash cycles).",
             "power_sensor": "Optional: sensor entity that reports the current power consumption in watts.",

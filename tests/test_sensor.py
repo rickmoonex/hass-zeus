@@ -123,12 +123,8 @@ async def test_recommended_output_sensor_with_forecast(
     )
     entry.add_to_hass(hass)
 
-    # Set up mock forecast.solar entity states
+    # Set up mock forecast power entity and solar production states
     hass.states.async_set("sensor.power_production_now", "3200")
-    hass.states.async_set("sensor.energy_production_today_remaining", "8500")
-    hass.states.async_set("sensor.energy_production_today", "12000")
-    hass.states.async_set("sensor.energy_current_hour", "800")
-    hass.states.async_set("sensor.energy_next_hour", "950")
     hass.states.async_set("sensor.solar_production", "3000")
     hass.states.async_set("sensor.home_energy_usage", "1500")
 
@@ -148,13 +144,9 @@ async def test_recommended_output_sensor_with_forecast(
     # Price is positive, so recommended output should be 100%
     assert float(state.state) == 100.0
 
-    # Verify forecast attributes are present
+    # Verify forecast production attribute is present (from configured power entity)
     attrs = state.attributes
     assert attrs["forecast_production_w"] == 3200.0
-    assert attrs["forecast_energy_today_remaining_wh"] == 8500.0
-    assert attrs["forecast_energy_today_wh"] == 12000.0
-    assert attrs["forecast_energy_current_hour_wh"] == 800.0
-    assert attrs["forecast_energy_next_hour_wh"] == 950.0
 
 
 async def test_recommended_output_sensor_without_forecast(

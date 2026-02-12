@@ -1,7 +1,7 @@
 {
   "domain": "zeus",
   "name": "Zeus",
-  "after_dependencies": ["forecast_solar"],
+  "after_dependencies": [],
   "codeowners": ["@rickmoonex"],
   "config_flow": true,
   "dependencies": ["recorder"],

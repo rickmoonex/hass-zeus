@@ -16,27 +16,26 @@ from homeassistant.components.recorder import history
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.recorder import get_instance
 from homeassistant.util import dt as dt_util
 
-try:
-    from homeassistant.components.forecast_solar.energy import (
-        async_get_solar_forecast as _get_forecast,
-    )
-except ImportError:
-    _get_forecast = None
-
 from .const import (
+    CONF_AVG_USAGE,
     CONF_CYCLE_DURATION,
     CONF_DAILY_RUNTIME,
     CONF_DEADLINE,
     CONF_DELAY_INTERVALS,
     CONF_ENERGY_USAGE_ENTITY,
+    CONF_FORECAST_API_KEY,
     CONF_MIN_CYCLE_TIME,
     CONF_PEAK_USAGE,
     CONF_POWER_SENSOR,
     CONF_PRIORITY,
     CONF_PRODUCTION_ENTITY,
+    CONF_SOLAR_AZIMUTH,
+    CONF_SOLAR_DECLINATION,
+    CONF_SOLAR_KWP,
     CONF_SWITCH_ENTITY,
     CONF_TEMPERATURE_SENSOR,
     CONF_TEMPERATURE_TOLERANCE,
@@ -49,6 +48,11 @@ from .const import (
     SUBENTRY_THERMOSTAT_DEVICE,
 )
 from .coordinator import PriceCoordinator, PriceSlot
+from .forecast_solar_api import (
+    ForecastSolarApiError,
+    ForecastSolarClient,
+    SolarPlaneConfig,
+)
 from .thermal_model import async_get_learned_avg_power_w, blend_with_peak
 
 _LOGGER = logging.getLogger(__name__)
@@ -259,52 +263,78 @@ async def async_get_runtime_today_minutes(
 
 async def async_get_solar_forecast(
     hass: HomeAssistant,
-) -> dict[str, Any] | None:
-    """Get hourly solar forecast from forecast.solar integration."""
-    entries = hass.config_entries.async_entries("forecast_solar")
-    if not entries:
-        _LOGGER.debug(
-            "No forecast_solar config entries found — solar forecast unavailable"
+    entry: ConfigEntry,
+) -> dict[str, float] | None:
+    """Get hourly solar forecast from Forecast.Solar API."""
+    # Collect solar plane configs from all solar_inverter subentries
+    planes: list[SolarPlaneConfig] = []
+    api_key: str | None = None
+
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != SUBENTRY_SOLAR_INVERTER:
+            continue
+        data = subentry.data
+        dec = data.get(CONF_SOLAR_DECLINATION)
+        az = data.get(CONF_SOLAR_AZIMUTH)
+        kwp = data.get(CONF_SOLAR_KWP)
+        if dec is None or az is None or kwp is None:
+            continue
+        planes.append(
+            SolarPlaneConfig(
+                declination=int(dec),
+                azimuth=int(az),
+                kwp=float(kwp),
+            )
         )
+        # Use the first API key found across subentries
+        if api_key is None:
+            api_key = data.get(CONF_FORECAST_API_KEY)
+
+    if not planes:
+        _LOGGER.debug("No solar planes configured, skipping forecast")
         return None
 
-    entry = entries[0]
-    _LOGGER.debug("Found forecast_solar entry: %s (id=%s)", entry.title, entry.entry_id)
+    # Use HA's configured latitude/longitude
+    latitude = hass.config.latitude
+    longitude = hass.config.longitude
 
-    if _get_forecast is None:
-        _LOGGER.warning(
-            "Could not import forecast_solar.energy module — "
-            "is the forecast_solar integration installed?"
-        )
-        return None
+    session = async_get_clientsession(hass)
+    client = ForecastSolarClient(
+        session=session,
+        latitude=latitude,
+        longitude=longitude,
+        planes=planes,
+        api_key=api_key,
+    )
 
     try:
-        result = await _get_forecast(hass, entry.entry_id)
-    except Exception:  # noqa: BLE001
-        _LOGGER.warning(
-            "Failed to call async_get_solar_forecast for entry %s",
-            entry.entry_id,
-            exc_info=True,
-        )
+        result = await client.async_get_estimate()
+    except ForecastSolarApiError:
+        _LOGGER.exception("Failed to fetch solar forecast")
         return None
 
-    if not result:
-        _LOGGER.debug("async_get_solar_forecast returned empty result: %s", result)
+    if not result.watts:
+        _LOGGER.warning("Solar forecast returned empty watts data")
         return None
 
-    if "wh_hours" not in result:
-        _LOGGER.debug(
-            "Forecast result missing 'wh_hours' key. Keys present: %s",
-            list(result.keys()),
-        )
-        return None
+    # Convert watts dict to wh_hours format for backward compatibility
+    # with the scheduler's _build_slot_info. The old format was
+    # {iso_string: wh_per_hour}. The new API gives us watts (avg power
+    # per period). We group by hour and average the watts, which equals
+    # the Wh for that hour.
+    wh_hours: dict[str, float] = {}
+    hourly_watts: dict[str, list[float]] = {}
 
-    wh_hours = result["wh_hours"]
-    _LOGGER.debug(
-        "Solar forecast retrieved: %d hourly entries, sample: %s",
-        len(wh_hours),
-        dict(list(wh_hours.items())[:3]) if wh_hours else "empty",
-    )
+    for dt_key, watts in result.watts.items():
+        # Group by the start of each hour
+        hour_start = dt_key.replace(minute=0, second=0, microsecond=0)
+        iso_key = hour_start.isoformat()
+        hourly_watts.setdefault(iso_key, []).append(watts)
+
+    for iso_key, watt_list in hourly_watts.items():
+        # Average watts over the hour = Wh for that hour
+        wh_hours[iso_key] = sum(watt_list) / len(watt_list)
+
     return wh_hours
 
 
@@ -969,7 +999,7 @@ async def async_run_scheduler(
     results: dict[str, ScheduleResult] = {}
 
     price_slots = _get_all_future_slots(coordinator)
-    solar_forecast = await async_get_solar_forecast(hass)
+    solar_forecast = await async_get_solar_forecast(hass, entry)
     home_consumption_w = _get_home_consumption(hass, entry)
     live_solar_surplus_w = _get_live_solar_surplus(hass, entry, home_consumption_w)
     now = dt_util.now()
@@ -1530,6 +1560,7 @@ class ManualDeviceScheduleRequest:
     priority: int
     power_sensor: str | None = None
     delay_intervals_h: list[float] | None = None  # e.g. [3, 6, 9]
+    avg_usage_w: float | None = None
 
 
 @dataclass
@@ -1625,7 +1656,7 @@ def _rank_all_contiguous_windows(
             continue
 
         total_cost, solar_fraction = _score_window(
-            window_slots, slot_info, request.peak_usage_w
+            window_slots, slot_info, request.peak_usage_w, request.avg_usage_w
         )
         end_time = window_slots[-1] + timedelta(minutes=SLOT_DURATION_MIN)
 
@@ -1677,7 +1708,7 @@ def _rank_delay_interval_windows(
             continue
 
         total_cost, solar_fraction = _score_window(
-            window_slots, slot_info, request.peak_usage_w
+            window_slots, slot_info, request.peak_usage_w, request.avg_usage_w
         )
         end_time = window_slots[-1] + timedelta(minutes=SLOT_DURATION_MIN)
 
@@ -1706,13 +1737,14 @@ def _score_window(
     window_slots: list[datetime],
     slot_info: dict[datetime, _SlotInfo],
     peak_usage_w: float,
+    avg_usage_w: float | None = None,
 ) -> tuple[float, float]:
     """Score a window — returns (total_cost, solar_fraction)."""
     total_cost = 0.0
     solar_count = 0
     for st in window_slots:
         slot = slot_info[st]
-        total_cost += _cost_for_device_in_slot(slot, peak_usage_w)
+        total_cost += _cost_for_device_in_slot(slot, avg_usage_w or peak_usage_w)
         if slot.remaining_solar_w >= peak_usage_w:
             solar_count += 1
     solar_fraction = solar_count / len(window_slots) if window_slots else 0.0
@@ -1753,6 +1785,7 @@ def _build_manual_device_requests(
                 subentry_id=subentry.subentry_id,
                 name=subentry.title,
                 peak_usage_w=float(data[CONF_PEAK_USAGE]),
+                avg_usage_w=float(data.get(CONF_AVG_USAGE, 0)) or None,
                 cycle_duration_min=cycle_duration,
                 priority=int(data.get(CONF_PRIORITY, 5)),
                 power_sensor=data.get(CONF_POWER_SENSOR),

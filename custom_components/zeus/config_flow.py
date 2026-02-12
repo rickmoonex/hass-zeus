@@ -35,6 +35,7 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CONF_ACCESS_TOKEN,
+    CONF_AVG_USAGE,
     CONF_CYCLE_DURATION,
     CONF_DAILY_RUNTIME,
     CONF_DEADLINE,
@@ -42,6 +43,7 @@ from .const import (
     CONF_DYNAMIC_CYCLE_DURATION,
     CONF_ENERGY_PROVIDER,
     CONF_ENERGY_USAGE_ENTITY,
+    CONF_FORECAST_API_KEY,
     CONF_FORECAST_ENTITY,
     CONF_MAX_POWER_OUTPUT,
     CONF_MIN_CYCLE_TIME,
@@ -50,6 +52,9 @@ from .const import (
     CONF_POWER_SENSOR,
     CONF_PRIORITY,
     CONF_PRODUCTION_ENTITY,
+    CONF_SOLAR_AZIMUTH,
+    CONF_SOLAR_DECLINATION,
+    CONF_SOLAR_KWP,
     CONF_SWITCH_ENTITY,
     CONF_TEMPERATURE_SENSOR,
     CONF_TEMPERATURE_TOLERANCE,
@@ -216,6 +221,36 @@ class SolarInverterSubentryFlow(ConfigSubentryFlow):
                             device_class="power",
                         )
                     ),
+                    vol.Required(CONF_SOLAR_DECLINATION, default=35): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0,
+                            max=90,
+                            step=1,
+                            unit_of_measurement="°",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Required(CONF_SOLAR_AZIMUTH, default=0): NumberSelector(
+                        NumberSelectorConfig(
+                            min=-180,
+                            max=180,
+                            step=1,
+                            unit_of_measurement="°",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Required(CONF_SOLAR_KWP): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0.1,
+                            max=100.0,
+                            step=0.01,
+                            unit_of_measurement="kWp",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(CONF_FORECAST_API_KEY): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                    ),
                 }
             ),
         )
@@ -260,6 +295,38 @@ class SolarInverterSubentryFlow(ConfigSubentryFlow):
                                 domain="sensor",
                                 device_class="power",
                             )
+                        ),
+                        vol.Required(
+                            CONF_SOLAR_DECLINATION, default=35
+                        ): NumberSelector(
+                            NumberSelectorConfig(
+                                min=0,
+                                max=90,
+                                step=1,
+                                unit_of_measurement="°",
+                                mode=NumberSelectorMode.BOX,
+                            )
+                        ),
+                        vol.Required(CONF_SOLAR_AZIMUTH, default=0): NumberSelector(
+                            NumberSelectorConfig(
+                                min=-180,
+                                max=180,
+                                step=1,
+                                unit_of_measurement="°",
+                                mode=NumberSelectorMode.BOX,
+                            )
+                        ),
+                        vol.Required(CONF_SOLAR_KWP): NumberSelector(
+                            NumberSelectorConfig(
+                                min=0.1,
+                                max=100.0,
+                                step=0.01,
+                                unit_of_measurement="kWp",
+                                mode=NumberSelectorMode.BOX,
+                            )
+                        ),
+                        vol.Optional(CONF_FORECAST_API_KEY): TextSelector(
+                            TextSelectorConfig(type=TextSelectorType.PASSWORD)
                         ),
                     }
                 ),
@@ -534,6 +601,15 @@ def _manual_device_schema() -> vol.Schema:
         {
             vol.Required("name"): str,
             vol.Required(CONF_PEAK_USAGE): NumberSelector(
+                NumberSelectorConfig(
+                    min=0,
+                    max=100000,
+                    step=1,
+                    unit_of_measurement="W",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(CONF_AVG_USAGE): NumberSelector(
                 NumberSelectorConfig(
                     min=0,
                     max=100000,

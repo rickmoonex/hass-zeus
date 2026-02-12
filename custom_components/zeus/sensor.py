@@ -351,7 +351,7 @@ class ZeusRecommendedOutputSensor(CoordinatorEntity[PriceCoordinator], SensorEnt
             consumption = self._get_home_consumption()
             attrs["home_consumption_w"] = consumption
 
-            # Solar forecast data (from forecast.solar integration)
+            # Solar forecast data from configured power entity
             forecast_entity = subentry_data.get(CONF_FORECAST_ENTITY)
             if forecast_entity:
                 attrs.update(self._get_forecast_data(forecast_entity))
@@ -389,18 +389,12 @@ class ZeusRecommendedOutputSensor(CoordinatorEntity[PriceCoordinator], SensorEnt
 
     def _get_forecast_data(self, forecast_entity: str) -> dict[str, Any]:
         """
-        Read solar forecast data from the configured forecast entity.
+        Read solar forecast data from the configured forecast power entity.
 
-        Returns a dict of forecast-related attributes. The forecast entity
-        is typically sensor.power_production_now from forecast.solar, but
-        any power sensor will work for the forecast_production_w value.
-
-        Additionally reads well-known forecast.solar entities for extra
-        context (energy today remaining, energy current/next hour).
+        Returns a dict with the current forecast production value in watts.
         """
         attrs: dict[str, Any] = {}
 
-        # Read the configured forecast power entity
         _LOGGER.debug("Reading forecast entity: %s", forecast_entity)
         state = self.hass.states.get(forecast_entity)
         if state and state.state not in ("unknown", "unavailable"):
@@ -421,37 +415,6 @@ class ZeusRecommendedOutputSensor(CoordinatorEntity[PriceCoordinator], SensorEnt
                 forecast_entity,
                 state.state if state else "missing",
             )
-
-        # Read well-known forecast.solar entities for additional context.
-        # These are hardcoded entity IDs from the forecast_solar integration.
-        forecast_entities = {
-            "forecast_energy_today_remaining_wh": (
-                "sensor.energy_production_today_remaining"
-            ),
-            "forecast_energy_today_wh": "sensor.energy_production_today",
-            "forecast_energy_current_hour_wh": "sensor.energy_current_hour",
-            "forecast_energy_next_hour_wh": "sensor.energy_next_hour",
-        }
-        for attr_key, entity_id in forecast_entities.items():
-            entity_state = self.hass.states.get(entity_id)
-            if entity_state and entity_state.state not in ("unknown", "unavailable"):
-                try:
-                    # forecast.solar stores native values in Wh but displays kWh
-                    attrs[attr_key] = float(entity_state.state)
-                except (ValueError, TypeError):
-                    attrs[attr_key] = None
-                    _LOGGER.debug(
-                        "Forecast entity %s has non-numeric state: %s",
-                        entity_id,
-                        entity_state.state,
-                    )
-            else:
-                attrs[attr_key] = None
-                _LOGGER.debug(
-                    "Forecast entity %s not found or unavailable (state=%s)",
-                    entity_id,
-                    entity_state.state if entity_state else "missing",
-                )
 
         return attrs
 

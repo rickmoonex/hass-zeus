@@ -430,3 +430,112 @@ def test_parse_delay_intervals():
     assert _parse_delay_intervals("abc") is None
     assert _parse_delay_intervals("1.5,3") == [1.5, 3.0]
     assert _parse_delay_intervals("0,-1,2") == [2.0]  # zero and negative filtered
+
+
+# ---------------------------------------------------------------------------
+# avg_usage_w cost calculation tests
+# ---------------------------------------------------------------------------
+
+
+def test_avg_usage_reduces_cost_with_partial_solar():
+    """avg_usage_w should produce lower cost when partial solar covers part of device.
+
+    The cost function _cost_for_device_in_slot uses the wattage param only for
+    partial solar calculations. Without solar, price is used as-is (EUR/kWh).
+    With partial solar, a lower wattage means a larger fraction is solar-covered,
+    resulting in lower cost.
+    """
+    base = datetime(2026, 2, 12, 10, 0, tzinfo=TZ)
+    now = base - timedelta(minutes=1)
+
+    # Solar surplus of 500W — partial for 2000W peak, better fraction for 800W avg
+    prices = [0.30, 0.30, 0.30, 0.30]
+    solar_w = [500.0, 500.0, 500.0, 500.0]
+    slot_info = _make_slot_info(base, prices, solar_w=solar_w)
+
+    # Peak only: solar_fraction = 500/2000 = 0.25, cost affected by partial solar
+    request_peak_only = ManualDeviceScheduleRequest(
+        subentry_id="dev_peak",
+        name="Peak Device",
+        peak_usage_w=2000.0,
+        cycle_duration_min=60.0,
+        priority=5,
+    )
+    # With avg: solar_fraction = 500/800 = 0.625, more solar coverage = lower cost
+    request_with_avg = ManualDeviceScheduleRequest(
+        subentry_id="dev_avg",
+        name="Avg Device",
+        peak_usage_w=2000.0,
+        cycle_duration_min=60.0,
+        priority=5,
+        avg_usage_w=800.0,
+    )
+
+    ranking_peak = compute_manual_device_rankings(request_peak_only, slot_info, now)
+    ranking_avg = compute_manual_device_rankings(request_with_avg, slot_info, now)
+
+    # Both should have windows
+    assert len(ranking_peak.windows) > 0
+    assert len(ranking_avg.windows) > 0
+
+    # avg_usage should produce lower cost due to better solar fraction in cost calc
+    assert ranking_avg.windows[0].total_cost < ranking_peak.windows[0].total_cost
+
+
+def test_avg_usage_does_not_affect_solar_comparison():
+    """Solar comparison should still use peak_usage_w, not avg_usage_w."""
+    base = datetime(2026, 2, 12, 10, 0, tzinfo=TZ)
+    now = base - timedelta(minutes=1)
+
+    # 4 slots with solar surplus of 1500W (enough for peak 1000W but uses
+    # peak for solar comparison)
+    prices = [0.25] * 4
+    solar_w = [1500.0] * 4
+    slot_info = _make_slot_info(base, prices, solar_w=solar_w)
+
+    request = ManualDeviceScheduleRequest(
+        subentry_id="dev1",
+        name="Device",
+        peak_usage_w=1000.0,
+        cycle_duration_min=60.0,
+        priority=5,
+        avg_usage_w=500.0,
+    )
+
+    ranking = compute_manual_device_rankings(request, slot_info, now)
+
+    assert len(ranking.windows) > 0
+    # Solar fraction should be 1.0 (solar_surplus 1500 >= peak 1000)
+    # This confirms peak is used for solar comparison, not avg
+    assert ranking.windows[0].solar_fraction == 1.0
+
+
+def test_avg_usage_none_falls_back_to_peak():
+    """When avg_usage_w is None, cost uses peak_usage_w."""
+    base = datetime(2026, 2, 12, 10, 0, tzinfo=TZ)
+    now = base - timedelta(minutes=1)
+
+    prices = [0.30, 0.30]
+    slot_info = _make_slot_info(base, prices)
+
+    request_none = ManualDeviceScheduleRequest(
+        subentry_id="dev1",
+        name="Device",
+        peak_usage_w=1000.0,
+        cycle_duration_min=15.0,
+        priority=5,
+        avg_usage_w=None,
+    )
+    request_explicit = ManualDeviceScheduleRequest(
+        subentry_id="dev2",
+        name="Device",
+        peak_usage_w=1000.0,
+        cycle_duration_min=15.0,
+        priority=5,
+    )
+
+    ranking_none = compute_manual_device_rankings(request_none, slot_info, now)
+    ranking_explicit = compute_manual_device_rankings(request_explicit, slot_info, now)
+
+    # Should produce identical costs
+    assert ranking_none.windows[0].total_cost == ranking_explicit.windows[0].total_cost

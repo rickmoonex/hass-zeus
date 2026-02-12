@@ -13,11 +13,18 @@ CONF_ACCESS_TOKEN = "access_token"  # noqa: S105
 # Tibber API
 TIBBER_API_ENDPOINT = "https://api.tibber.com/v1-beta/gql"
 
+# Forecast.Solar API
+FORECAST_SOLAR_API_BASE = "https://api.forecast.solar"
+
 # Solar inverter subentry config keys
 CONF_PRODUCTION_ENTITY = "production_entity"
 CONF_OUTPUT_CONTROL_ENTITY = "output_control_entity"
 CONF_MAX_POWER_OUTPUT = "max_power_output"
 CONF_FORECAST_ENTITY = "forecast_entity"
+CONF_SOLAR_DECLINATION = "solar_declination"
+CONF_SOLAR_AZIMUTH = "solar_azimuth"
+CONF_SOLAR_KWP = "solar_kwp"
+CONF_FORECAST_API_KEY = "forecast_api_key"
 
 # Home energy monitor subentry config keys
 CONF_ENERGY_USAGE_ENTITY = "energy_usage_entity"
@@ -40,6 +47,7 @@ CONF_TEMPERATURE_TOLERANCE = "temperature_tolerance"
 CONF_CYCLE_DURATION = "cycle_duration"
 CONF_DYNAMIC_CYCLE_DURATION = "dynamic_cycle_duration"
 CONF_DELAY_INTERVALS = "delay_intervals"
+CONF_AVG_USAGE = "avg_usage"
 
 # Scheduler
 SLOT_DURATION_MIN = 15

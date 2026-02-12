@@ -10,6 +10,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.zeus.const import (
     CONF_ACCESS_TOKEN,
+    CONF_AVG_USAGE,
+    CONF_CYCLE_DURATION,
     CONF_DAILY_RUNTIME,
     CONF_DEADLINE,
     CONF_ENERGY_PROVIDER,
@@ -21,10 +23,14 @@ from custom_components.zeus.const import (
     CONF_POWER_SENSOR,
     CONF_PRIORITY,
     CONF_PRODUCTION_ENTITY,
+    CONF_SOLAR_AZIMUTH,
+    CONF_SOLAR_DECLINATION,
+    CONF_SOLAR_KWP,
     CONF_SWITCH_ENTITY,
     DOMAIN,
     ENERGY_PROVIDER_TIBBER,
     SUBENTRY_HOME_MONITOR,
+    SUBENTRY_MANUAL_DEVICE,
     SUBENTRY_SOLAR_INVERTER,
     SUBENTRY_SWITCH_DEVICE,
 )
@@ -132,6 +138,9 @@ async def test_solar_inverter_subentry_flow(
             CONF_PRODUCTION_ENTITY: "sensor.solar_production",
             CONF_OUTPUT_CONTROL_ENTITY: "number.inverter_output",
             CONF_MAX_POWER_OUTPUT: 5000,
+            CONF_SOLAR_DECLINATION: 35,
+            CONF_SOLAR_AZIMUTH: 0,
+            CONF_SOLAR_KWP: 6.5,
         },
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
@@ -206,6 +215,9 @@ async def test_solar_inverter_subentry_with_forecast(
             CONF_OUTPUT_CONTROL_ENTITY: "number.inverter_output",
             CONF_MAX_POWER_OUTPUT: 5000,
             CONF_FORECAST_ENTITY: "sensor.power_production_now",
+            CONF_SOLAR_DECLINATION: 30,
+            CONF_SOLAR_AZIMUTH: -10,
+            CONF_SOLAR_KWP: 8.0,
         },
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
@@ -278,6 +290,31 @@ async def test_multiple_switch_device_subentries(
             CONF_PEAK_USAGE: 1800,
             CONF_DAILY_RUNTIME: 90,
             CONF_DEADLINE: "23:00:00",
+            CONF_PRIORITY: 5,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Dishwasher"
+
+
+async def test_manual_device_subentry_flow(
+    hass: HomeAssistant, mock_setup_entry, mock_config_entry
+) -> None:
+    """Test adding a manual device subentry with avg_usage."""
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, SUBENTRY_MANUAL_DEVICE),
+        context={"source": "user"},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            "name": "Dishwasher",
+            CONF_PEAK_USAGE: 2000,
+            CONF_AVG_USAGE: 800,
+            CONF_CYCLE_DURATION: 90,
             CONF_PRIORITY: 5,
         },
     )
