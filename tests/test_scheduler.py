@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
+from unittest.mock import MagicMock
 
 from custom_components.zeus.coordinator import PriceSlot
 from custom_components.zeus.scheduler import (
     DeviceScheduleRequest,
+    _get_managed_device_draw,
     compute_schedules,
 )
 
@@ -781,3 +783,44 @@ def test_live_solar_peak_must_fit_fully() -> None:
     assert not results["dev1"].should_be_on
     assert results["dev1"].scheduled_slots[0] == slot_1015
     assert results["dev1"].reason == "Waiting for cheaper slot"
+
+
+def test_managed_device_draw_sums_active_devices() -> None:
+    """Managed device draw should sum actual usage of ON devices only."""
+    # Device 1: ON, drawing 1700W
+    dev1 = _make_device(subentry_id="boiler", peak_usage_w=1700.0)
+    dev1.is_on = True
+    dev1.actual_usage_w = 1700.0
+
+    # Device 2: OFF, no draw
+    dev2 = _make_device(subentry_id="washer", peak_usage_w=2000.0)
+    dev2.is_on = False
+    dev2.actual_usage_w = 0.0
+
+    # Device 3: ON, actual reading available
+    dev3 = _make_device(subentry_id="dryer", peak_usage_w=3000.0)
+    dev3.is_on = True
+    dev3.actual_usage_w = 2500.0
+
+    # The function also reads thermostat entities from HA, but with a
+    # mock entry that has no subentries it will skip that part.
+    mock_hass = MagicMock()
+    mock_entry = MagicMock()
+    mock_entry.subentries = {}
+
+    total = _get_managed_device_draw(mock_hass, mock_entry, [dev1, dev2, dev3])
+    assert total == 4200.0  # 1700 + 0 (off) + 2500
+
+
+def test_managed_device_draw_ignores_none_actual() -> None:
+    """Devices ON but with no actual_usage_w reading should not contribute."""
+    dev = _make_device(subentry_id="boiler", peak_usage_w=1700.0)
+    dev.is_on = True
+    dev.actual_usage_w = None
+
+    mock_hass = MagicMock()
+    mock_entry = MagicMock()
+    mock_entry.subentries = {}
+
+    total = _get_managed_device_draw(mock_hass, mock_entry, [dev])
+    assert total == 0.0

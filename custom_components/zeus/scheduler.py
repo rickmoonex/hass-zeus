@@ -1017,9 +1017,30 @@ async def async_run_scheduler(
     price_slots = _get_all_future_slots(coordinator)
     solar_forecast = await async_get_solar_forecast(hass, entry, coordinator)
     coordinator.solar_forecast = solar_forecast
-    home_consumption_w = _get_home_consumption(hass, entry)
-    live_solar_surplus_w = _get_live_solar_surplus(hass, entry, home_consumption_w)
+    raw_home_consumption_w = _get_home_consumption(hass, entry)
     now = dt_util.now()
+
+    # --- Switch devices ---
+    devices = _build_device_requests(entry)
+    if devices:
+        await _async_populate_switch_devices(hass, devices)
+
+    # Subtract power draw of Zeus-managed devices that are currently ON from
+    # home consumption.  The home monitor reports total household load which
+    # includes devices controlled by Zeus.  If we don't subtract them, a
+    # device turning on inflates home consumption → reduces the apparent
+    # solar surplus → scheduler reschedules the device to a "cheaper" slot
+    # → device turns off → surplus returns → feedback loop.
+    managed_draw_w = _get_managed_device_draw(hass, entry, devices)
+    home_consumption_w = max(0.0, raw_home_consumption_w - managed_draw_w)
+    if managed_draw_w > 0:
+        _LOGGER.debug(
+            "Home consumption: %.0fW raw - %.0fW managed = %.0fW net",
+            raw_home_consumption_w,
+            managed_draw_w,
+            home_consumption_w,
+        )
+    live_solar_surplus_w = _get_live_solar_surplus(hass, entry, home_consumption_w)
 
     # Build shared slot info once — all device types deplete the same solar pool.
     shared_slot_info: dict[datetime, _SlotInfo] | None = None
@@ -1041,9 +1062,7 @@ async def async_run_scheduler(
         )
 
     # --- Switch devices ---
-    devices = _build_device_requests(entry)
     if devices:
-        await _async_populate_switch_devices(hass, devices)
         if shared_slot_info is not None:
             switch_results, shared_slot_info = _compute_schedules_with_slot_info(
                 devices, shared_slot_info, now
@@ -1152,6 +1171,46 @@ def _get_all_future_slots(coordinator: PriceCoordinator) -> list[PriceSlot]:
         return []
 
     return coordinator.data.get(home, [])
+
+
+def _get_managed_device_draw(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    switch_devices: list[DeviceScheduleRequest] | None = None,
+) -> float:
+    """
+    Sum the live power draw of all Zeus-managed devices that are currently ON.
+
+    This includes switch devices and thermostat devices.  The value is
+    subtracted from the home monitor reading so that Zeus's own managed
+    load doesn't inflate the "background" home consumption used for
+    solar surplus calculations.
+    """
+    total = 0.0
+
+    # Switch devices (already populated with live state if provided)
+    if switch_devices:
+        for device in switch_devices:
+            if device.is_on and device.actual_usage_w is not None:
+                total += device.actual_usage_w
+
+    # Thermostat devices — read directly from power sensors
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != SUBENTRY_THERMOSTAT_DEVICE:
+            continue
+        switch_entity = subentry.data.get(CONF_SWITCH_ENTITY)
+        power_sensor = subentry.data.get(CONF_POWER_SENSOR)
+        if not switch_entity or not power_sensor:
+            continue
+        switch_state = hass.states.get(switch_entity)
+        if switch_state is None or switch_state.state != "on":
+            continue
+        power_state = hass.states.get(power_sensor)
+        if power_state and power_state.state not in ("unknown", "unavailable"):
+            with contextlib.suppress(ValueError, TypeError):
+                total += float(power_state.state)
+
+    return total
 
 
 def _get_home_consumption(hass: HomeAssistant, entry: ConfigEntry) -> float:
