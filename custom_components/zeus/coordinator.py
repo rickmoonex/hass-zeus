@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import importlib
 import logging
@@ -43,14 +44,16 @@ from .const import (
     SUBENTRY_THERMOSTAT_DEVICE,
 )
 from .thermal_model import ThermalTracker
-from .tibber_api import TibberApiClient, TibberApiError
+from .tibber_api import TibberApiClient, TibberApiError, TibberAuthError
 
 if TYPE_CHECKING:
     from .scheduler import ManualDeviceRanking, ScheduleResult
 
 _LOGGER = logging.getLogger(__name__)
 
-PRICE_UPDATE_INTERVAL = timedelta(hours=1)
+PRICE_UPDATE_INTERVAL = timedelta(minutes=15)
+PRICE_FETCH_MAX_RETRIES = 3
+PRICE_FETCH_BASE_DELAY = 30  # seconds; doubles each retry (30, 60, 120)
 FORECAST_CACHE_TTL = timedelta(hours=1)
 THERMAL_STORAGE_KEY = "zeus_thermal_trackers"
 THERMAL_STORAGE_VERSION = 1
@@ -88,9 +91,10 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
     """
     Coordinator to fetch and cache energy prices.
 
-    Fetches new price data from the energy provider every hour and
-    re-evaluates the current slot at every 15-minute boundary so
-    sensors always reflect the active price window.
+    Fetches new price data from the energy provider every 15 minutes
+    and re-evaluates the current slot at every 15-minute boundary so
+    sensors always reflect the active price window.  Transient API
+    failures are retried with exponential backoff before giving up.
     """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, provider: str) -> None:
@@ -483,14 +487,35 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         return result
 
     async def _fetch_tibber_prices(self) -> dict[str, list[PriceSlot]]:
-        """Fetch prices from the Tibber API using our own client."""
+        """Fetch prices from the Tibber API with retry on transient errors."""
         client = self._get_tibber_client()
 
-        try:
-            homes = await client.async_get_prices()
-        except TibberApiError as err:
-            msg = f"Failed to fetch Tibber prices: {err}"
-            raise UpdateFailed(msg) from err
+        last_err: Exception | None = None
+        for attempt in range(1 + PRICE_FETCH_MAX_RETRIES):
+            try:
+                homes = await client.async_get_prices()
+                break
+            except TibberAuthError as err:
+                # Auth errors are permanent — do not retry
+                msg = f"Tibber authentication failed: {err}"
+                raise UpdateFailed(msg) from err
+            except TibberApiError as err:
+                last_err = err
+                if attempt < PRICE_FETCH_MAX_RETRIES:
+                    delay = PRICE_FETCH_BASE_DELAY * (2**attempt)
+                    _LOGGER.warning(
+                        "Tibber API request failed (attempt %d/%d), "
+                        "retrying in %ds: %s",
+                        attempt + 1,
+                        1 + PRICE_FETCH_MAX_RETRIES,
+                        delay,
+                        err,
+                    )
+                    await asyncio.sleep(delay)
+        else:
+            total = 1 + PRICE_FETCH_MAX_RETRIES
+            msg = f"Failed to fetch Tibber prices after {total} attempts: {last_err}"
+            raise UpdateFailed(msg) from last_err
 
         if not homes:
             msg = "No homes returned from Tibber API"

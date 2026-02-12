@@ -16,9 +16,10 @@ from custom_components.zeus.const import (
     DOMAIN,
     ENERGY_PROVIDER_TIBBER,
 )
-from custom_components.zeus.coordinator import PriceCoordinator
+from custom_components.zeus.coordinator import PRICE_UPDATE_INTERVAL, PriceCoordinator
 from custom_components.zeus.tibber_api import (
     TibberApiError,
+    TibberAuthError,
     TibberHome,
     TibberPriceEntry,
 )
@@ -310,7 +311,12 @@ async def test_coordinator_handles_api_error(
         side_effect=TibberApiError("Connection failed")
     )
 
-    with _patch_tibber_client(mock_client):
+    with (
+        _patch_tibber_client(mock_client),
+        patch(
+            "custom_components.zeus.coordinator.asyncio.sleep", new_callable=AsyncMock
+        ),
+    ):
         coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
         await coordinator.async_refresh()
 
@@ -463,3 +469,117 @@ async def test_coordinator_energy_price_stored_in_slots(
     assert slot is not None
     assert slot.price == 0.25  # total
     assert slot.energy_price == 0.18  # energy only
+
+
+async def test_coordinator_update_interval_is_15_minutes(
+    hass: HomeAssistant, mock_entry: MockConfigEntry
+) -> None:
+    """Test that the price update interval is 15 minutes."""
+    assert timedelta(minutes=15) == PRICE_UPDATE_INTERVAL
+
+    coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
+    assert coordinator.update_interval == timedelta(minutes=15)
+
+
+async def test_coordinator_retries_on_transient_error(
+    hass: HomeAssistant, mock_entry: MockConfigEntry
+) -> None:
+    """Test that transient API errors are retried and succeed on later attempt."""
+    now = dt_util.now()
+    base_time = now.replace(minute=0, second=0, microsecond=0)
+    response = _make_api_response(base_time=base_time, num_slots=8)
+
+    mock_client = AsyncMock()
+    # Fail twice, then succeed
+    mock_client.async_get_prices = AsyncMock(
+        side_effect=[
+            TibberApiError("timeout"),
+            TibberApiError("server error"),
+            response,
+        ]
+    )
+
+    with (
+        _patch_tibber_client(mock_client),
+        patch(
+            "custom_components.zeus.coordinator.asyncio.sleep", new_callable=AsyncMock
+        ),
+    ):
+        coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
+        await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is True
+    assert coordinator.data is not None
+    assert "Test Home" in coordinator.data
+    assert mock_client.async_get_prices.call_count == 3
+
+
+async def test_coordinator_retries_exhausted(
+    hass: HomeAssistant, mock_entry: MockConfigEntry
+) -> None:
+    """Test that UpdateFailed is raised after all retries are exhausted."""
+    mock_client = AsyncMock()
+    # Fail on all 4 attempts (1 initial + 3 retries)
+    mock_client.async_get_prices = AsyncMock(
+        side_effect=TibberApiError("persistent failure")
+    )
+
+    with (
+        _patch_tibber_client(mock_client),
+        patch(
+            "custom_components.zeus.coordinator.asyncio.sleep", new_callable=AsyncMock
+        ),
+    ):
+        coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
+        await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is False
+    # 1 initial + 3 retries = 4 total attempts
+    assert mock_client.async_get_prices.call_count == 4
+
+
+async def test_coordinator_no_retry_on_auth_error(
+    hass: HomeAssistant, mock_entry: MockConfigEntry
+) -> None:
+    """Test that authentication errors are NOT retried."""
+    mock_client = AsyncMock()
+    mock_client.async_get_prices = AsyncMock(
+        side_effect=TibberAuthError("invalid token")
+    )
+
+    with (
+        _patch_tibber_client(mock_client),
+        patch(
+            "custom_components.zeus.coordinator.asyncio.sleep", new_callable=AsyncMock
+        ) as mock_sleep,
+    ):
+        coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
+        await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is False
+    # Auth error should NOT trigger retries — only 1 call
+    assert mock_client.async_get_prices.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+async def test_coordinator_retry_uses_exponential_backoff(
+    hass: HomeAssistant, mock_entry: MockConfigEntry
+) -> None:
+    """Test that retry delays follow exponential backoff (30s, 60s, 120s)."""
+    mock_client = AsyncMock()
+    mock_client.async_get_prices = AsyncMock(side_effect=TibberApiError("failure"))
+
+    with (
+        _patch_tibber_client(mock_client),
+        patch(
+            "custom_components.zeus.coordinator.asyncio.sleep", new_callable=AsyncMock
+        ) as mock_sleep,
+    ):
+        coordinator = PriceCoordinator(hass, mock_entry, ENERGY_PROVIDER_TIBBER)
+        await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is False
+    # 3 retries → 3 sleep calls with increasing delays
+    assert mock_sleep.call_count == 3
+    delays = [call.args[0] for call in mock_sleep.call_args_list]
+    assert delays == [30, 60, 120]

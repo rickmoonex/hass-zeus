@@ -100,7 +100,7 @@ def test_ranking_picks_cheapest_window():
 
 
 def test_ranking_uses_all_available_slots():
-    """Rankings should consider all slots in the price data (no deadline cutoff)."""
+    """Rankings should consider slots up to the next 06:00 boundary."""
     base = datetime(2026, 2, 11, 10, 0, tzinfo=TZ)
     now = base - timedelta(minutes=1)
 
@@ -539,3 +539,77 @@ def test_avg_usage_none_falls_back_to_peak():
 
     # Should produce identical costs
     assert ranking_none.windows[0].total_cost == ranking_explicit.windows[0].total_cost
+
+
+# ---------------------------------------------------------------------------
+# Next-day 06:00 cutoff tests
+# ---------------------------------------------------------------------------
+
+
+def test_ranking_excludes_slots_after_next_6am():
+    """Slots after the next 06:00 should be excluded from ranking."""
+    # Now is 22:00, so cutoff is tomorrow 06:00 (8 hours away = 32 slots)
+    base = datetime(2026, 2, 11, 22, 0, tzinfo=TZ)
+    now = base
+
+    # 48 slots (12 hours: 22:00 today → 10:00 tomorrow)
+    # Cheapest slots are at 08:00 tomorrow (after cutoff)
+    prices = [0.30] * 32 + [0.05] * 16  # first 32 expensive, last 16 cheap
+    slot_info = _make_slot_info(base, prices)
+
+    request = _make_manual_request(cycle_duration_min=60.0)  # 4 slots
+    ranking = compute_manual_device_rankings(request, slot_info, now)
+
+    # All windows should end by 06:00 tomorrow
+    cutoff = datetime(2026, 2, 12, 6, 0, tzinfo=TZ)
+    for w in ranking.windows:
+        assert w.start_time < cutoff
+        assert w.end_time <= cutoff
+
+    # The cheap slots (after 06:00) should NOT appear
+    assert ranking.recommended_start is not None
+    assert ranking.recommended_start < cutoff
+
+
+def test_ranking_before_6am_uses_today_6am_cutoff():
+    """When now is before 06:00, cutoff is today's 06:00."""
+    # Now is 02:00, cutoff should be 06:00 today (4 hours away = 16 slots)
+    base = datetime(2026, 2, 11, 2, 0, tzinfo=TZ)
+    now = base
+
+    # 32 slots (8 hours: 02:00 → 10:00)
+    # Cheapest slots are at 08:00 (after 06:00 cutoff)
+    prices = [0.30] * 16 + [0.05] * 16
+    slot_info = _make_slot_info(base, prices)
+
+    request = _make_manual_request(cycle_duration_min=60.0)  # 4 slots
+    ranking = compute_manual_device_rankings(request, slot_info, now)
+
+    # All windows should be before 06:00 today
+    cutoff = datetime(2026, 2, 11, 6, 0, tzinfo=TZ)
+    for w in ranking.windows:
+        assert w.start_time < cutoff
+
+    # The cheap slots (after 06:00) should NOT appear
+    assert all(w.total_cost > 0.20 for w in ranking.windows)
+
+
+def test_ranking_at_6am_uses_next_day_cutoff():
+    """When now is exactly 06:00, cutoff is next day 06:00 (full 24h)."""
+    base = datetime(2026, 2, 11, 6, 0, tzinfo=TZ)
+    now = base
+
+    # 96 slots (24h: 06:00 today → 06:00 tomorrow)
+    prices = [0.30] * 48 + [0.10] * 48  # cheaper in second half
+    slot_info = _make_slot_info(base, prices)
+
+    request = _make_manual_request(cycle_duration_min=60.0)  # 4 slots
+    ranking = compute_manual_device_rankings(request, slot_info, now)
+
+    # Should include slots up to next day 06:00
+    cutoff = datetime(2026, 2, 12, 6, 0, tzinfo=TZ)
+    assert any(
+        w.start_time >= datetime(2026, 2, 11, 18, 0, tzinfo=TZ) for w in ranking.windows
+    )
+    for w in ranking.windows:
+        assert w.start_time < cutoff

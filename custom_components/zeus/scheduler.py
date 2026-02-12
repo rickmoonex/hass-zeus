@@ -1668,6 +1668,9 @@ def compute_manual_device_rankings(
     """
     Rank all contiguous time windows for a manual device cycle.
 
+    Only slots until the next 06:00 local time are considered, so
+    recommendations stay within an actionable overnight horizon.
+
     For devices with delay intervals, only windows starting at valid delay
     offsets from ``now`` are considered. Otherwise, every contiguous block
     of ``ceil(cycle_duration / 15)`` future slots is evaluated.
@@ -1676,9 +1679,18 @@ def compute_manual_device_rankings(
     if slots_needed <= 0:
         return _empty_ranking(request.subentry_id)
 
-    # Use all available future slots (scoped by however far the price data extends)
+    # Only consider slots until the next day at 06:00 local time.
+    tomorrow_6am = (now + timedelta(days=1)).replace(
+        hour=6, minute=0, second=0, microsecond=0
+    )
+    # If it's already past midnight but before 06:00, use today's 06:00
+    today_6am = now.replace(hour=6, minute=0, second=0, microsecond=0)
+    cutoff = today_6am if now < today_6am else tomorrow_6am
+
     eligible = sorted(
-        st for st in slot_info if st + timedelta(minutes=SLOT_DURATION_MIN) > now
+        st
+        for st in slot_info
+        if st + timedelta(minutes=SLOT_DURATION_MIN) > now and st < cutoff
     )
     if not eligible:
         return _empty_ranking(request.subentry_id)
