@@ -115,6 +115,10 @@ def test_parse_response_success():
     watts_values = list(result.watts.values())
     assert 1500.0 in watts_values
 
+    # All datetime keys should be timezone-aware
+    for dt_key in result.watts:
+        assert dt_key.tzinfo is not None
+
 
 def test_parse_response_error_code():
     """API error code should raise ForecastSolarApiError."""
@@ -144,16 +148,17 @@ def test_parse_response_empty_result():
 
 
 def test_parse_datetime_dict_valid():
-    """Valid datetime strings are parsed correctly."""
+    """Valid datetime strings are parsed as timezone-aware datetimes."""
     raw = {
         "2026-02-12 08:00:00": 100,
         "2026-02-12 09:30:00": 500,
     }
     parsed = _parse_datetime_dict(raw)
     assert len(parsed) == 2
-    # All values should be floats
-    for v in parsed.values():
+    # All values should be floats and keys should be timezone-aware
+    for k, v in parsed.items():
         assert isinstance(v, float)
+        assert k.tzinfo is not None
 
 
 def test_parse_datetime_dict_invalid_key_skipped():

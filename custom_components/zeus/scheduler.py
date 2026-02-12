@@ -264,8 +264,20 @@ async def async_get_runtime_today_minutes(
 async def async_get_solar_forecast(
     hass: HomeAssistant,
     entry: ConfigEntry,
+    coordinator: PriceCoordinator | None = None,
 ) -> dict[str, float] | None:
-    """Get hourly solar forecast from Forecast.Solar API."""
+    """
+    Get hourly solar forecast from Forecast.Solar API.
+
+    Results are cached on the coordinator for 1 hour to stay within
+    the Forecast.Solar free-tier rate limit (12 requests/hour).
+    """
+    # Return cached forecast if available and fresh
+    if coordinator is not None:
+        cached = coordinator.get_cached_forecast()
+        if cached is not None:
+            return cached
+
     # Collect solar plane configs from all solar_inverter subentries
     planes: list[SolarPlaneConfig] = []
     api_key: str | None = None
@@ -334,6 +346,10 @@ async def async_get_solar_forecast(
     for iso_key, watt_list in hourly_watts.items():
         # Average watts over the hour = Wh for that hour
         wh_hours[iso_key] = sum(watt_list) / len(watt_list)
+
+    # Cache the result on the coordinator
+    if coordinator is not None:
+        coordinator.set_cached_forecast(wh_hours)
 
     return wh_hours
 
@@ -999,7 +1015,8 @@ async def async_run_scheduler(
     results: dict[str, ScheduleResult] = {}
 
     price_slots = _get_all_future_slots(coordinator)
-    solar_forecast = await async_get_solar_forecast(hass, entry)
+    solar_forecast = await async_get_solar_forecast(hass, entry, coordinator)
+    coordinator.solar_forecast = solar_forecast
     home_consumption_w = _get_home_consumption(hass, entry)
     live_solar_surplus_w = _get_live_solar_surplus(hass, entry, home_consumption_w)
     now = dt_util.now()

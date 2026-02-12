@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -85,6 +85,7 @@ async def async_setup_entry(
         ZeusTodayMinPriceSensor(coordinator, entry),
         ZeusTodayMaxPriceSensor(coordinator, entry),
         ZeusCheapestUpcomingPriceSensor(coordinator, entry),
+        ZeusSolarForecastSensor(coordinator, entry),
     ]
 
     entities.extend(
@@ -605,6 +606,70 @@ class ZeusSolarFractionSensor(CoordinatorEntity[PriceCoordinator], SensorEntity)
             self._attr_native_value = 100.0 if production and production > 0 else 0.0
         else:
             self._attr_native_value = None
+
+
+class ZeusSolarForecastSensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
+    """Today's total forecasted solar production in kWh."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "solar_forecast_today"
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the solar forecast sensor."""
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_solar_forecast_today"
+        self._attr_device_info = _device_info(entry)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        forecast = self.coordinator.solar_forecast
+        if not forecast:
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {}
+            return
+
+        now = dt_util.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        day_after_start = tomorrow_start + timedelta(days=1)
+
+        today_total = 0.0
+        tomorrow_total = 0.0
+        hourly_today: dict[str, float] = {}
+        hourly_tomorrow: dict[str, float] = {}
+
+        for iso_key, wh in forecast.items():
+            try:
+                dt_key = datetime.fromisoformat(iso_key)
+            except (ValueError, TypeError):
+                continue
+            # Ensure timezone-aware for comparison with today_start
+            if dt_key.tzinfo is None:
+                dt_key = dt_key.replace(tzinfo=today_start.tzinfo)
+            kwh = wh / 1000.0
+            if today_start <= dt_key < tomorrow_start:
+                today_total += kwh
+                hourly_today[dt_key.strftime("%H:%M")] = round(kwh, 3)
+            elif tomorrow_start <= dt_key < day_after_start:
+                tomorrow_total += kwh
+                hourly_tomorrow[dt_key.strftime("%H:%M")] = round(kwh, 3)
+
+        self._attr_native_value = round(today_total, 2)
+        self._attr_extra_state_attributes = {
+            "today_total_kwh": round(today_total, 3),
+            "tomorrow_total_kwh": round(tomorrow_total, 3),
+            "hourly_today": hourly_today,
+            "hourly_tomorrow": hourly_tomorrow,
+        }
 
 
 # ---------------------------------------------------------------------------

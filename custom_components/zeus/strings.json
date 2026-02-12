@@ -357,6 +357,9 @@
       "cheapest_upcoming_price": {
         "name": "Cheapest upcoming price"
       },
+      "solar_forecast_today": {
+        "name": "Solar forecast today"
+      },
       "switch_device_remaining_runtime": {
         "name": "{device_name} remaining runtime"
       },

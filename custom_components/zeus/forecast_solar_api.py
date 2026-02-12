@@ -158,12 +158,20 @@ class ForecastSolarClient:
 
 
 def _parse_datetime_dict(raw: dict[str, Any]) -> dict[datetime, float]:
-    """Parse a dict of 'YYYY-MM-DD HH:MM:SS' -> value into datetime -> float."""
+    """
+    Parse a dict of 'YYYY-MM-DD HH:MM:SS' -> value into datetime -> float.
+
+    Forecast.Solar returns naive datetimes in the timezone of the configured
+    location, which matches HA's default timezone. We attach the timezone so
+    all downstream comparisons work with aware datetimes.
+    """
     parsed: dict[datetime, float] = {}
     for key, value in raw.items():
         try:
             dt = dt_util.parse_datetime(key.replace(" ", "T"))
             if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
                 parsed[dt] = float(value)
         except (ValueError, TypeError):
             _LOGGER.debug("Skipping unparseable forecast key: %s", key)

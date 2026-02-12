@@ -608,3 +608,74 @@ async def test_device_schedule_binary_sensor_has_min_cycle_time_default(
     attrs = states[0].attributes
     assert attrs["min_cycle_time_min"] == 0.0
     assert attrs["cycle_locked"] is False
+
+
+async def test_solar_forecast_sensor_with_data(
+    hass: HomeAssistant,
+) -> None:
+    """Test that the solar forecast sensor shows today's total and hourly breakdown."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Zeus",
+        data=_entry_data(),
+        unique_id=DOMAIN,
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_tibber_client():
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Build a forecast dict with hours for today and tomorrow
+    now = dt_util.now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = today + timedelta(days=1)
+
+    forecast = {}
+    # 3 hours today: 500 Wh each
+    for h in (8, 10, 14):
+        forecast[(today + timedelta(hours=h)).isoformat()] = 500.0
+    # 2 hours tomorrow: 700 Wh each
+    for h in (9, 13):
+        forecast[(tomorrow + timedelta(hours=h)).isoformat()] = 700.0
+
+    coordinator.solar_forecast = forecast
+    coordinator.async_set_updated_data(coordinator.data)
+    await hass.async_block_till_done()
+
+    state = hass.states.get("sensor.zeus_energy_manager_solar_forecast_today")
+    assert state is not None
+    assert float(state.state) == 1.5  # 1500 Wh = 1.5 kWh
+
+    attrs = state.attributes
+    assert attrs["today_total_kwh"] == 1.5
+    assert attrs["tomorrow_total_kwh"] == 1.4
+    assert len(attrs["hourly_today"]) == 3
+    assert attrs["hourly_today"]["08:00"] == 0.5
+    assert attrs["hourly_today"]["10:00"] == 0.5
+    assert attrs["hourly_today"]["14:00"] == 0.5
+    assert len(attrs["hourly_tomorrow"]) == 2
+
+
+async def test_solar_forecast_sensor_without_data(
+    hass: HomeAssistant,
+) -> None:
+    """Test that the solar forecast sensor is None when no forecast is available."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Zeus",
+        data=_entry_data(),
+        unique_id=DOMAIN,
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_tibber_client():
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    state = hass.states.get("sensor.zeus_energy_manager_solar_forecast_today")
+    assert state is not None
+    # No forecast data set on coordinator, state should be unknown
+    assert state.state == "unknown"

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 PRICE_UPDATE_INTERVAL = timedelta(hours=1)
+FORECAST_CACHE_TTL = timedelta(hours=1)
 THERMAL_STORAGE_KEY = "zeus_thermal_trackers"
 THERMAL_STORAGE_VERSION = 1
 
@@ -121,6 +122,9 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
             hass, RESERVATION_STORAGE_VERSION, RESERVATION_STORAGE_KEY
         )
         self.manual_device_results: dict[str, ManualDeviceRanking] = {}
+        self.solar_forecast: dict[str, float] | None = None
+        self._forecast_cache: dict[str, float] | None = None
+        self._forecast_cache_time: datetime | None = None
 
     def _get_tibber_client(self) -> TibberApiClient:
         """Get or create the Tibber API client."""
@@ -622,6 +626,21 @@ class PriceCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         """Get the total price for the next 15-minute slot."""
         slot = self.get_next_slot()
         return slot.price if slot else None
+
+    def get_cached_forecast(self) -> dict[str, float] | None:
+        """Return cached forecast if still valid, else None."""
+        if (
+            self._forecast_cache is not None
+            and self._forecast_cache_time is not None
+            and dt_util.utcnow() - self._forecast_cache_time < FORECAST_CACHE_TTL
+        ):
+            return self._forecast_cache
+        return None
+
+    def set_cached_forecast(self, forecast: dict[str, float]) -> None:
+        """Store a fresh forecast in the cache."""
+        self._forecast_cache = forecast
+        self._forecast_cache_time = dt_util.utcnow()
 
     def _has_managed_devices(self) -> bool:
         """Check if any managed device subentries are configured."""
