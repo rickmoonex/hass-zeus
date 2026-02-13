@@ -679,3 +679,171 @@ async def test_solar_forecast_sensor_without_data(
     assert state is not None
     # No forecast data set on coordinator, state should be unknown
     assert state.state == "unknown"
+
+
+async def test_energy_prices_sensor_with_data(
+    hass: HomeAssistant,
+) -> None:
+    """Test that the energy prices sensor exposes hourly price arrays."""
+    now = dt_util.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start = today_start + timedelta(days=1)
+
+    # Build 96 slots for today + 16 for tomorrow with varying prices
+    prices = []
+    for i in range(96):
+        slot_time = today_start + timedelta(minutes=15 * i)
+        total = 0.20 + (i * 0.001)
+        prices.append(
+            TibberPriceEntry(
+                start_time=slot_time,
+                energy=total * 0.8,
+                tax=total * 0.2,
+                total=round(total, 4),
+                level="NORMAL",
+                currency="EUR",
+            )
+        )
+    for i in range(16):
+        slot_time = tomorrow_start + timedelta(minutes=15 * i)
+        total = 0.30 + (i * 0.001)
+        prices.append(
+            TibberPriceEntry(
+                start_time=slot_time,
+                energy=total * 0.8,
+                tax=total * 0.2,
+                total=round(total, 4),
+                level="NORMAL",
+                currency="EUR",
+            )
+        )
+
+    response = {
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=prices,
+        )
+    }
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Zeus",
+        data=_entry_data(),
+        unique_id=DOMAIN,
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_tibber_client(response):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    state = hass.states.get("sensor.zeus_energy_manager_energy_prices")
+    assert state is not None
+
+    # State should be the number of hourly entries for today
+    # (some early hours may be pruned by the coordinator cache)
+    assert int(state.state) >= 20
+
+    attrs = state.attributes
+    assert "prices_today" in attrs
+    assert "prices_tomorrow" in attrs
+    assert "min_price" in attrs
+    assert "max_price" in attrs
+
+    # prices_today should be a list of hourly dicts (some early hours
+    # may be pruned from the coordinator cache)
+    assert isinstance(attrs["prices_today"], list)
+    assert len(attrs["prices_today"]) >= 20
+
+    # Each entry should have 'start' and 'price'
+    first = attrs["prices_today"][0]
+    assert "start" in first
+    assert "price" in first
+
+    # Min/max should span the price range
+    assert attrs["min_price"] <= attrs["max_price"]
+
+    # Tomorrow should have data (we added 16 tomorrow slots = 4 hours)
+    assert len(attrs["prices_tomorrow"]) == 4
+
+
+async def test_energy_prices_sensor_without_data(
+    hass: HomeAssistant,
+) -> None:
+    """Test that the energy prices sensor handles no data gracefully."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Zeus",
+        data=_entry_data(),
+        unique_id=DOMAIN,
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_tibber_client():
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    state = hass.states.get("sensor.zeus_energy_manager_energy_prices")
+    assert state is not None
+
+    # Should have prices_today/prices_tomorrow attributes even if sparse
+    attrs = state.attributes
+    assert "prices_today" in attrs
+    assert "prices_tomorrow" in attrs
+
+
+async def test_current_price_sensor_has_min_max_attributes(
+    hass: HomeAssistant,
+) -> None:
+    """Test that the current price sensor includes min/max price attributes."""
+    now = dt_util.now()
+    # Start from the current 15-min aligned slot so nothing is pruned
+    minutes = (now.minute // 15) * 15
+    slot_base = now.replace(minute=minutes, second=0, microsecond=0)
+
+    # Build 8 slots from now with distinct prices
+    prices = []
+    for i in range(8):
+        slot_time = slot_base + timedelta(minutes=15 * i)
+        total = 0.10 + (i * 0.05)  # 0.10, 0.15, 0.20, ... 0.45
+        prices.append(
+            TibberPriceEntry(
+                start_time=slot_time,
+                energy=total * 0.8,
+                tax=total * 0.2,
+                total=round(total, 4),
+                level="NORMAL",
+                currency="EUR",
+            )
+        )
+
+    response = {
+        "Test Home": TibberHome(
+            home_id="home-123",
+            name="Test Home",
+            prices=prices,
+        )
+    }
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Zeus",
+        data=_entry_data(),
+        unique_id=DOMAIN,
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_tibber_client(response):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    state = hass.states.get("sensor.zeus_energy_manager_current_energy_price")
+    assert state is not None
+
+    attrs = state.attributes
+    # min/max should be present (slots are for today)
+    assert "min_price" in attrs
+    assert "max_price" in attrs
+    assert attrs["min_price"] == 0.10
+    assert attrs["max_price"] == 0.45

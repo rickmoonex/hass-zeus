@@ -360,6 +360,9 @@
       "solar_forecast_today": {
         "name": "Solar forecast today"
       },
+      "energy_prices": {
+        "name": "Energy prices"
+      },
       "switch_device_remaining_runtime": {
         "name": "{device_name} remaining runtime"
       },

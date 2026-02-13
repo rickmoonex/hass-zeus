@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -86,6 +87,7 @@ async def async_setup_entry(
         ZeusTodayMaxPriceSensor(coordinator, entry),
         ZeusCheapestUpcomingPriceSensor(coordinator, entry),
         ZeusSolarForecastSensor(coordinator, entry),
+        ZeusEnergyPricesSensor(coordinator, entry),
     ]
 
     entities.extend(
@@ -167,7 +169,30 @@ class ZeusCurrentPriceSensor(CoordinatorEntity[PriceCoordinator], SensorEntity):
             attrs["energy_price"] = slot.energy_price
         if self.coordinator.price_override is not None:
             attrs["price_override"] = self.coordinator.price_override
+
+        # Add today's min/max prices
+        today_slots = self._get_today_slots()
+        if today_slots:
+            attrs["min_price"] = min(s.price for s in today_slots)
+            attrs["max_price"] = max(s.price for s in today_slots)
+
         self._attr_extra_state_attributes = attrs
+
+    def _get_today_slots(self) -> list[Any]:
+        """Return all price slots for today."""
+        if not self.coordinator.data:
+            return []
+        home = self.coordinator.get_first_home_name()
+        if not home:
+            return []
+        now = dt_util.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        return [
+            s
+            for s in self.coordinator.data.get(home, [])
+            if today_start <= s.start_time < tomorrow_start
+        ]
 
 
 class ZeusCurrentEnergyOnlyPriceSensor(
@@ -837,6 +862,90 @@ class ZeusCheapestUpcomingPriceSensor(_ZeusPriceSensorBase):
         else:
             self._attr_native_value = None
             self._attr_extra_state_attributes = {}
+
+
+class ZeusEnergyPricesSensor(_ZeusPriceSensorBase):
+    """
+    Full price schedule for dashboard charts.
+
+    State is the number of hourly price entries available for today.
+    Attributes expose per-slot price arrays suitable for apexcharts-card
+    ``data_generator``.
+    """
+
+    _attr_translation_key = "energy_prices"
+    _attr_native_unit_of_measurement = None
+    _attr_state_class = None
+    _attr_icon = "mdi:chart-line"
+
+    def __init__(self, coordinator: PriceCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the energy prices sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_energy_prices"
+        self._update_state()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    def _get_tomorrow_slots(self) -> list[Any]:
+        """Return all price slots for tomorrow."""
+        if not self.coordinator.data:
+            return []
+        home = self.coordinator.get_first_home_name()
+        if not home:
+            return []
+        now = dt_util.now()
+        tomorrow_start = now.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + timedelta(days=1)
+        day_after = tomorrow_start + timedelta(days=1)
+        return [
+            s
+            for s in self.coordinator.data.get(home, [])
+            if tomorrow_start <= s.start_time < day_after
+        ]
+
+    @staticmethod
+    def _slots_to_hourly(slots: list[Any]) -> list[dict[str, Any]]:
+        """Aggregate 15-min slots into hourly averages."""
+        hourly: dict[str, list[float]] = defaultdict(list)
+        for s in slots:
+            hour_start = s.start_time.replace(minute=0, second=0, microsecond=0)
+            hourly[hour_start.isoformat()].append(s.price)
+
+        return [
+            {
+                "start": iso,
+                "price": round(sum(prices) / len(prices), 4),
+            }
+            for iso, prices in sorted(hourly.items())
+        ]
+
+    @callback
+    def _update_state(self) -> None:
+        today_slots = self._get_today_slots()
+        tomorrow_slots = self._get_tomorrow_slots()
+
+        prices_today = self._slots_to_hourly(today_slots)
+        prices_tomorrow = self._slots_to_hourly(tomorrow_slots)
+
+        self._attr_native_value = len(prices_today)
+
+        attrs: dict[str, Any] = {
+            "prices_today": prices_today,
+            "prices_tomorrow": prices_tomorrow,
+        }
+
+        if today_slots:
+            attrs["min_price"] = min(s.price for s in today_slots)
+            attrs["max_price"] = max(s.price for s in today_slots)
+            slot = self.coordinator.get_current_slot()
+            if slot:
+                attrs["current_price"] = slot.price
+
+        self._attr_extra_state_attributes = attrs
 
 
 # ---------------------------------------------------------------------------
