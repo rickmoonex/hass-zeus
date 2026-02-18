@@ -741,9 +741,9 @@ async def test_energy_prices_sensor_with_data(
     state = hass.states.get("sensor.zeus_energy_manager_energy_prices")
     assert state is not None
 
-    # State should be the number of hourly entries for today
-    # (some early hours may be pruned by the coordinator cache)
-    assert int(state.state) >= 20
+    # State should have hourly entries for today (past hours may be pruned
+    # by the coordinator cache which drops slots older than 1 hour)
+    assert int(state.state) >= 1
 
     attrs = state.attributes
     assert "prices_today" in attrs
@@ -751,10 +751,10 @@ async def test_energy_prices_sensor_with_data(
     assert "min_price" in attrs
     assert "max_price" in attrs
 
-    # prices_today should be a list of hourly dicts (some early hours
-    # may be pruned from the coordinator cache)
+    # prices_today should be a list of hourly dicts (past hours are
+    # pruned from the coordinator cache)
     assert isinstance(attrs["prices_today"], list)
-    assert len(attrs["prices_today"]) >= 20
+    assert len(attrs["prices_today"]) >= 1
 
     # Each entry should have 'start' and 'price'
     first = attrs["prices_today"][0]
