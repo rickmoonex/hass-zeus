@@ -4,20 +4,23 @@ A Home Assistant custom integration for managing dynamic energy bills. Zeus fetc
 
 ## Features
 
-- **Dynamic energy pricing** -- fetches 15-minute price slots from Tibber
+- **Dynamic energy pricing** -- fetches 15-minute price slots from Tibber every 15 minutes with automatic retry on failure
 - **Solar inverter output control** -- reduces inverter output during negative prices to avoid paying for grid export
 - **Device scheduling** -- automatically turns devices on/off at optimal times based on price, solar forecast, and real-time solar production
 - **Thermostat control** -- software thermostat for heating zones with temperature-aware, price/solar-optimized scheduling
+- **Manual device recommendations** -- recommends cheapest run windows for non-smart devices (dishwashers, ovens, etc.) with one-tap reservation
 - **Real-time solar surplus** -- opportunistically activates devices when live solar exceeds the forecast
 - **Global cost optimization** -- minimizes total energy cost across all devices, with shared solar surplus and concurrent slot usage
 - **Minimum cycle time protection** -- prevents rapid toggling that could damage devices like compressors or washing machines
-- **Solar forecast integration** -- uses forecast.solar hourly data for scheduling and sensor attributes
+- **Solar forecast integration** -- built-in Forecast.Solar API client with 1-hour caching for solar-aware scheduling
+- **Energy dashboard sensors** -- hourly price arrays, today/tomorrow forecasts, and price analytics for custom dashboards
+- **Feedback loop prevention** -- subtracts managed device power from home consumption to prevent on/off cycling
 
 ## Requirements
 
 - Home Assistant 2024.1.0+
 - An energy provider integration set up in HA (currently Tibber only)
-- Optional: [forecast.solar](https://www.home-assistant.io/integrations/forecast_solar/) for solar-aware scheduling
+- Optional: Solar panels with known declination, azimuth, and kWp for Forecast.Solar integration
 
 ## Installation
 
@@ -53,8 +56,12 @@ From the Zeus integration page, click **Add solar inverter**.
 | **Output control entity** | Number entity (0-100%) controlling inverter output |
 | **Maximum power output** | Max inverter power in watts |
 | **Solar forecast entity** | (Optional) Power sensor from forecast.solar, e.g., `sensor.power_production_now` |
+| **Panel declination** | Tilt angle of panels in degrees (0 = horizontal, 90 = vertical) |
+| **Panel azimuth** | Compass direction panels face (-180 = north, 0 = south, 90 = west) |
+| **Installed capacity (kWp)** | Total peak power of this panel array in kilowatt-peak |
+| **Forecast.Solar API key** | (Optional) API key for higher rate limits. Free tier: 12 requests/hour |
 
-The inverter subentry enables the **Recommended inverter output** sensor and provides live solar data to the scheduler.
+The inverter subentry enables the **Recommended inverter output** sensor, provides live solar data to the scheduler, and fetches solar production forecasts from the Forecast.Solar API.
 
 ### 3. Add a home energy monitor (optional, max 1)
 
@@ -98,11 +105,32 @@ Click **Add thermostat device** for each heating zone you want Zeus to manage as
 | **Priority** | 1 (highest) to 10 (lowest) -- higher priority zones get solar surplus first |
 | **Minimum cycle time** | (Optional, default 5) Minimum minutes the heater must stay on or off before switching |
 
+### 6. Add manual devices (unlimited)
+
+Click **Add manual device** for non-smart devices that you start manually (dishwashers, ovens, etc.). Zeus recommends the cheapest time window and lets you reserve it so smart devices plan around it.
+
+| Field | Description |
+|---|---|
+| **Name** | Display name (e.g., "Dishwasher") |
+| **Peak power usage** | Peak power consumption in watts. Used to determine if solar surplus can fully cover the device. |
+| **Average power usage** | (Optional) Average consumption over a full cycle in watts. Used for more realistic cost calculation. |
+| **Cycle duration** | Default cycle duration in minutes (e.g., 90 for a dishwasher) |
+| **Dynamic cycle duration** | Allow changing the cycle duration before each run via a number entity |
+| **Power sensor** | (Optional) Sensor reporting current power consumption in watts |
+| **Delay intervals** | (Optional) Comma-separated delay hours the device supports (e.g., `3,6,9`). When set, Zeus recommends the cheapest delay interval instead of an exact start time. |
+| **Priority** | 1 (highest) to 10 (lowest) -- higher priority devices get solar surplus first when reserving |
+
+Manual device recommendations are limited to slots until the next 06:00 local time, keeping suggestions within an actionable overnight horizon.
+
 ## How it works
 
 ### Price fetching
 
-Zeus calls `tibber.get_prices` every hour and caches the 15-minute price slots. At every 15-minute boundary (`:00`, `:15`, `:30`, `:45`), it re-evaluates the current slot and reruns the scheduler.
+Zeus fetches prices from the Tibber GraphQL API every **15 minutes** and caches the 15-minute price slots. This ensures new prices (especially tomorrow's day-ahead data published around 13:00 CET) are picked up promptly.
+
+If the Tibber API fails, Zeus retries with **exponential backoff** (30s, 60s, 120s) before giving up. Authentication errors fail immediately without retry. After all retries are exhausted, the next regular 15-minute poll tries again.
+
+At every 15-minute boundary (`:00`, `:15`, `:30`, `:45`), the scheduler reruns to re-evaluate device schedules with the current slot.
 
 ### Recommended inverter output
 
@@ -185,6 +213,12 @@ For the **current slot**, if the live solar surplus (production minus consumptio
 
 This ensures that excess solar production is used to power devices rather than being exported.
 
+### Managed device power deduction
+
+When Zeus turns on a device (e.g., a boiler at 1700W), the home energy monitor reports the increased total household load. Without correction, the scheduler would see reduced solar surplus, recalculate the slot as more expensive, and turn the device off -- creating an on/off feedback loop.
+
+Zeus prevents this by subtracting the live power draw of all managed devices (switches and thermostats that are currently ON) from the raw home consumption reading before computing solar surplus. This ensures the scheduler sees only the unmanaged background load when evaluating slot costs.
+
 ### Forecast bias correction
 
 When live solar surplus exceeds the forecast for the current slot, Zeus computes a **bias correction factor** and applies it to all future slots. This compensates for systematic forecast under-prediction.
@@ -235,15 +269,54 @@ The `cycle_locked` attribute on the binary sensor shows whether the device is cu
 
 ## Entities
 
-### Sensors
+### Price sensors
 
-| Entity | Description |
-|---|---|
-| **Current energy price** | Current 15-minute slot price in EUR/kWh |
-| **Next slot price** | Price for the upcoming 15-minute slot |
-| **Recommended inverter output** | Optimal inverter output percentage (per solar inverter) |
+| Entity | State | Unit | Description |
+|---|---|---|---|
+| **Current energy price** | Current total price (energy + tax) | EUR/kWh | The price you pay for grid consumption |
+| **Current energy-only price** | Energy-only price (no tax) | EUR/kWh | The price relevant for grid export / feed-in |
+| **Next slot price** | Next 15-min slot total price | EUR/kWh | |
+| **Today average price** | Average across all today's slots | EUR/kWh | Attribute: `slot_count` |
+| **Today minimum price** | Lowest price today | EUR/kWh | Attribute: `slot_start` (when it occurs) |
+| **Today maximum price** | Highest price today | EUR/kWh | Attribute: `slot_start` (when it occurs) |
+| **Cheapest upcoming price** | Lowest price in remaining slots | EUR/kWh | Attribute: `slot_start` |
+| **Energy prices** | Number of hourly entries today | -- | Dashboard sensor (see below) |
 
-The recommended output sensor includes these extra attributes when a forecast entity is configured:
+The **Current energy price** sensor includes these attributes:
+- `slot_start` -- ISO timestamp of the current 15-min slot
+- `energy_price` -- energy-only price (no tax)
+- `min_price` -- today's lowest price
+- `max_price` -- today's highest price
+- `price_override` -- override value if set
+
+The **Energy prices** sensor is designed for dashboard charts (e.g., apexcharts-card `data_generator`):
+- `prices_today` -- array of `{start, price}` objects, one per hour (averaged from 15-min slots)
+- `prices_tomorrow` -- same format for tomorrow (populated when Tibber publishes day-ahead prices, typically after ~13:00 CET)
+- `min_price` -- today's lowest price
+- `max_price` -- today's highest price
+- `current_price` -- current slot's price
+
+### Solar & energy sensors
+
+| Entity | State | Unit | Description |
+|---|---|---|---|
+| **Solar surplus** | Production minus consumption | W | 0 when consumption exceeds production |
+| **Solar self-consumption ratio** | min(consumption, production) / production | % | How much solar you use vs export |
+| **Home consumption** | Live home energy usage | W | From the home energy monitor entity |
+| **Grid import** | max(0, consumption - production) | W | What you're drawing from the grid |
+| **Solar fraction** | min(100, production / consumption) | % | How much of consumption is solar-covered |
+| **Solar forecast today** | Total forecasted production today | kWh | Attributes: `hourly_today`, `hourly_tomorrow`, `today_total_kwh`, `tomorrow_total_kwh` |
+
+### Device sensors
+
+| Entity | State | Description |
+|---|---|---|
+| **Recommended inverter output** | Optimal output % | Per solar inverter. 100% when prices positive; reduced to match home consumption when negative. |
+| **{Device} runtime today** | Minutes run today | Per switch device. State class: `total_increasing` |
+| **{Device} heating runtime today** | Minutes heated today | Per thermostat device. State class: `total_increasing` |
+| **{Device} recommended start** | Recommended start time (HH:MM) | Per manual device (see below) |
+
+The **Recommended inverter output** sensor includes these extra attributes when a forecast entity is configured:
 
 - `forecast_production_w` -- current forecast production
 - `forecast_energy_today_remaining_wh`
@@ -251,13 +324,23 @@ The recommended output sensor includes these extra attributes when a forecast en
 - `forecast_energy_current_hour_wh`
 - `forecast_energy_next_hour_wh`
 
+The **Manual device recommendation** sensor includes:
+- `recommended_start` / `recommended_end` -- ISO timestamps of the cheapest window
+- `estimated_cost` -- estimated cost in EUR for the recommended window
+- `cost_if_now` -- what it would cost to run right now
+- `savings_pct` -- percentage saved vs running now
+- `ranked_windows` -- top 10 windows sorted by cost, each with `start`, `end`, `cost`, `solar_pct`
+- `reserved` -- whether a slot is currently reserved
+- `reservation_start` / `reservation_end` -- reserved window timestamps
+
 ### Binary sensors
 
 | Entity | Description |
 |---|---|
-| **Negative energy price** | ON when the current price is negative |
+| **Negative energy price** | ON when the current energy-only price is negative |
 | **{Device} schedule** | ON when Zeus wants the device running (per switch device) |
 | **{Device} heating** | ON when Zeus wants the heater running (per thermostat device) |
+| **{Device} reserved** | ON when a manual device has a reserved time slot |
 
 The device schedule binary sensor includes these attributes:
 
@@ -307,6 +390,15 @@ Possible heating reasons:
 - `Coasting: waiting for cheaper slot (rank N%, urgency M%)`
 - `Coasting: solar surplus expected soon`
 - `No temperature reading -- holding current state`
+
+### Other entities
+
+| Entity | Type | Description |
+|---|---|---|
+| **Master switch** | Switch | Enable/disable all Zeus management globally |
+| **{Device} reserve slot** | Button | Per manual device. Reserves the recommended time window. |
+| **{Device} cycle duration** | Number | Per manual device (when dynamic cycle duration is enabled). Adjust cycle length before reserving. |
+| **{Device} thermostat** | Climate | Per thermostat device. Set target temperature and mode (heat/off). |
 
 ## Services
 
