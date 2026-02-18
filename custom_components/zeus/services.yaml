@@ -20,3 +20,34 @@ clear_price_override:
 run_scheduler:
   name: Run scheduler
   description: Manually trigger the device scheduler. Recomputes optimal time slots for all managed switch devices and updates their binary sensors. Also applies switch control decisions immediately.
+
+reserve_manual_device:
+  name: Reserve manual device
+  description: Reserve a time window for a manual device. Other smart devices will plan around this reservation.
+  fields:
+    subentry_id:
+      name: Subentry ID
+      description: The subentry ID of the manual device to reserve.
+      required: true
+      example: "abc123"
+      selector:
+        text:
+    start_time:
+      name: Start time
+      description: Optional start time for the reservation (ISO format). Defaults to the recommended start time.
+      required: false
+      example: "2026-02-14T10:00:00"
+      selector:
+        text:
+
+cancel_reservation:
+  name: Cancel reservation
+  description: Cancel an active manual device reservation.
+  fields:
+    subentry_id:
+      name: Subentry ID
+      description: The subentry ID of the manual device whose reservation to cancel.
+      required: true
+      example: "abc123"
+      selector:
+        text:

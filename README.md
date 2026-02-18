@@ -18,8 +18,8 @@ A Home Assistant custom integration for managing dynamic energy bills. Zeus fetc
 
 ## Requirements
 
-- Home Assistant 2024.1.0+
-- An energy provider integration set up in HA (currently Tibber only)
+- Home Assistant 2025.3.0+ (requires subentry support)
+- A Tibber account with a personal access token (create one at [developer.tibber.com](https://developer.tibber.com/settings/access-token))
 - Optional: Solar panels with known declination, azimuth, and kWp for Forecast.Solar integration
 
 ## Installation
@@ -43,7 +43,7 @@ Zeus uses a single config entry with subentries for each component. Only one Zeu
 
 Go to **Settings > Devices & Services > Add Integration** and search for **Zeus**.
 
-Select your energy price provider (currently only Tibber). The Tibber integration must already be set up in HA.
+Select your energy price provider (currently only Tibber). You will then be prompted to enter your **Tibber personal access token**. Zeus connects directly to the Tibber GraphQL API -- no separate Tibber HA integration is needed.
 
 ### 2. Add a solar inverter (optional, max 1)
 
@@ -55,7 +55,7 @@ From the Zeus integration page, click **Add solar inverter**.
 | **Current production entity** | Sensor reporting current solar production in watts |
 | **Output control entity** | Number entity (0-100%) controlling inverter output |
 | **Maximum power output** | Max inverter power in watts |
-| **Solar forecast entity** | (Optional) Power sensor from forecast.solar, e.g., `sensor.power_production_now` |
+| **Solar forecast entity** | (Optional) Power sensor for extra attributes on the recommended output sensor. Does NOT drive the scheduler -- the built-in Forecast.Solar API client handles that. |
 | **Panel declination** | Tilt angle of panels in degrees (0 = horizontal, 90 = vertical) |
 | **Panel azimuth** | Compass direction panels face (-180 = north, 0 = south, 90 = west) |
 | **Installed capacity (kWp)** | Total peak power of this panel array in kilowatt-peak |
@@ -88,6 +88,7 @@ Click **Add switch device** for each device you want Zeus to manage.
 | **Deadline** | Time by which the daily runtime must be completed |
 | **Priority** | 1 (highest) to 10 (lowest) -- higher priority devices get cheaper slots first |
 | **Minimum cycle time** | (Optional) Minimum minutes the device must stay on or off before switching. Protects against rapid toggling. Set to 0 to disable. |
+| **Use actual power** | (Optional, default off) When enabled, uses live power sensor readings instead of peak power for solar surplus calculations. Enable for devices that may draw no power while on (e.g., a boiler with an internal thermostat). Disable for devices with fluctuating power (e.g., a washing machine). |
 
 ### 5. Add thermostat devices (unlimited)
 
@@ -114,7 +115,7 @@ Click **Add manual device** for non-smart devices that you start manually (dishw
 |---|---|
 | **Name** | Display name (e.g., "Dishwasher") |
 | **Peak power usage** | Peak power consumption in watts. Used to determine if solar surplus can fully cover the device. |
-| **Average power usage** | (Optional) Average consumption over a full cycle in watts. Used for more realistic cost calculation. |
+| **Average power usage** | Average consumption over a full cycle in watts. Used for cost calculation to give a realistic picture of actual energy use. |
 | **Cycle duration** | Default cycle duration in minutes (e.g., 90 for a dishwasher) |
 | **Dynamic cycle duration** | Allow changing the cycle duration before each run via a number entity |
 | **Power sensor** | (Optional) Sensor reporting current power consumption in watts |
@@ -317,20 +318,28 @@ The **Energy prices** sensor is designed for dashboard charts (e.g., apexcharts-
 | **{Device} heating runtime today** | Minutes heated today | Per thermostat device. State class: `total_increasing` |
 | **{Device} recommended start** | Recommended start time (HH:MM) | Per manual device (see below) |
 
-The **Recommended inverter output** sensor includes these extra attributes when a forecast entity is configured:
+The **Recommended inverter output** sensor includes these attributes:
 
-- `forecast_production_w` -- current forecast production
-- `forecast_energy_today_remaining_wh`
-- `forecast_energy_today_wh`
-- `forecast_energy_current_hour_wh`
-- `forecast_energy_next_hour_wh`
+- `energy_price_is_negative` -- whether the current energy-only price is negative
+- `current_production_w` -- live solar production in watts
+- `home_consumption_w` -- live home consumption in watts
+- `max_power_output_w` -- configured max inverter power
+- `forecast_production_w` -- current forecast production (only when a forecast entity is configured)
+- `price_override` -- override value if set
 
 The **Manual device recommendation** sensor includes:
+- `subentry_id` -- the subentry identifier
+- `cycle_duration_min` -- current cycle duration in minutes
+- `peak_usage_w` -- configured peak power
+- `dynamic_cycle_duration` -- whether dynamic cycle duration is enabled
+- `number_entity_id` -- entity ID of the cycle duration number (if dynamic)
+- `has_delay_intervals` -- whether delay intervals are configured
 - `recommended_start` / `recommended_end` -- ISO timestamps of the cheapest window
 - `estimated_cost` -- estimated cost in EUR for the recommended window
+- `delay_hours` -- recommended delay in hours (only for devices with delay intervals)
 - `cost_if_now` -- what it would cost to run right now
 - `savings_pct` -- percentage saved vs running now
-- `ranked_windows` -- top 10 windows sorted by cost, each with `start`, `end`, `cost`, `solar_pct`
+- `ranked_windows` -- top 10 windows sorted by cost, each with `start`, `end`, `cost`, `solar_pct` (and `delay_hours` for delay-interval devices)
 - `reserved` -- whether a slot is currently reserved
 - `reservation_start` / `reservation_end` -- reserved window timestamps
 
@@ -365,6 +374,7 @@ Possible schedule reasons:
 - `Forced on: deadline pressure` -- must run, no time to wait
 - `Waiting for cheaper slot` -- a better slot is coming
 - `Daily runtime already met` -- done for the day
+- `Daily runtime met` -- runtime target reached (device is off)
 
 The thermostat heating binary sensor includes these attributes:
 
@@ -375,8 +385,8 @@ The thermostat heating binary sensor includes these attributes:
 - `temperature_sensor` -- the temperature sensor entity
 - `current_temperature` -- live temperature reading
 - `target_temperature` -- configured target
-- `temperature_margin` -- configured margin
-- `lower_bound` / `upper_bound` -- computed comfort range
+- `temperature_tolerance` -- configured tolerance
+- `heating_lower_bound` / `heating_upper_bound` -- computed comfort range
 - `priority` -- configured priority
 - `min_cycle_time_min` -- configured minimum cycle time
 - `cycle_locked` -- whether the heater is held by the cycle guard
@@ -390,6 +400,11 @@ Possible heating reasons:
 - `Heating: cheap price (rank N%, urgency M%)`
 - `Coasting: waiting for cheaper slot (rank N%, urgency M%)`
 - `Coasting: solar surplus expected soon`
+- `Coasting: thermal headroom X.Xh, cheaper slot available`
+- `Heating: low thermal headroom (X.Xh to lower bound)`
+- `Heating: no price data, urgency-based fallback`
+- `Coasting: no price data, urgency-based fallback`
+- `Thermostat off` -- HVAC mode set to off
 - `No temperature reading -- holding current state`
 
 ### Other entities
@@ -429,6 +444,27 @@ Manually trigger the scheduler. Recomputes schedules and applies switch control 
 service: zeus.run_scheduler
 ```
 
+### `zeus.reserve_manual_device`
+
+Reserve a time window for a manual device. Other smart devices will plan around this reservation.
+
+```yaml
+service: zeus.reserve_manual_device
+data:
+  subentry_id: "abc123"  # the manual device subentry ID
+  start_time: "2026-02-14T10:00:00"  # optional, defaults to recommended start
+```
+
+### `zeus.cancel_reservation`
+
+Cancel an active manual device reservation.
+
+```yaml
+service: zeus.cancel_reservation
+data:
+  subentry_id: "abc123"  # the manual device subentry ID
+```
+
 ## Debugging
 
 Enable debug logging for Zeus:
@@ -463,13 +499,14 @@ Key log messages to look for:
 ### Running
 
 ```bash
-nix run  # starts HA dev server with Zeus loaded
+nix develop  # enter dev shell and create .venv (first time only)
+nix run      # starts HA dev server with Zeus loaded on port 8123
 ```
 
 ### Testing
 
 ```bash
-pip install -r requirements_dev.txt
+nix develop          # or: pip install -r requirements_dev.txt
 pytest tests/ -v
 ```
 
