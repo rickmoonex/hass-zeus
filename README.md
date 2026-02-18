@@ -100,10 +100,11 @@ Click **Add thermostat device** for each heating zone you want Zeus to manage as
 | **Power sensor** | Sensor reporting the heater's current power consumption in watts |
 | **Temperature sensor** | Sensor reporting the zone temperature in degrees Celsius |
 | **Peak power usage** | Maximum power the heater draws in watts |
-| **Target temperature** | Desired temperature for the zone (5-30 C) |
-| **Temperature margin** | Allowed deviation from target (0.5-5.0 C). Zeus keeps temp within target +/- margin |
+| **Temperature tolerance** | Allowed deviation from target temperature. Zeus heats between target minus and target plus this value. |
 | **Priority** | 1 (highest) to 10 (lowest) -- higher priority zones get solar surplus first |
 | **Minimum cycle time** | (Optional, default 5) Minimum minutes the heater must stay on or off before switching |
+
+After adding a thermostat device, set the desired target temperature on the **climate entity** (`climate.{name}_thermostat`) in Home Assistant. Zeus will maintain the temperature within target +/- tolerance.
 
 ### 6. Add manual devices (unlimited)
 
